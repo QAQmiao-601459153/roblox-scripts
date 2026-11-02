@@ -15,6 +15,12 @@
 -- 修复 13: 持续掉耐久的设备 —— 耐久高于阈值不修 + 修过后进入冷却，不再一圈圈来回跑
 -- 修复 14: 高耐久设备修不满 —— 到点后停在旁边反复补，修满或超时才走（单台最多停留可调）
 -- 新增 15: 巡回时标记当前目标 —— 橙色高亮 + 头顶置顶圆点，随时看得到下一台要修哪
+-- 新增 16: 弹速自动读取 —— 换枪自动从 TREK GunConfig 读 ProjectileVelocity（含别名解包），
+--          并按 GunConfig 的 ProjectileAcceleration 做下坠补偿；读不到时退回手填滑块
+-- 新增 17: 69 把枪的弹速/重力/射程全部硬编码进 GunSpeed.DB（实读失败时自动兜底）；
+--          内置管理员用户名名单（mod.txt 里带 @ 的那些真实用户名）作为反管理默认名单
+-- 修复 18: 弹速改为"内置表优先"，实读游戏配置降级为手动开关（默认关）——
+--          实测 require 游戏配置后枪会拿不上，不能让它跟着换枪自动跑
 -- ============================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -28,7 +34,26 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-01 r42 · 目标高亮标记 / 停留修满"
+local SCRIPT_VERSION = "2026-11-01 r45 · 弹速改为内置表优先 / 实读改为手动开关"
+
+-- ============================ 内置管理员名单 ============================
+-- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
+-- 上面那行是可以随便改的显示名（游戏昵称），所以这里只抄 @ 后面的用户名，全部按小写比对。
+-- 面板「反管理」页里可以直接追加/移除；按「清空管理员名单」会把这一整份也清掉。
+local MOD_USERNAMES = {
+    "Quaza_Keidoo", "Exinatiny", "korraged", "crafty_jayden12356", "Nixxorei",
+    "Joemotheris", "Danny_Will", "Ps2cho_k", "AvariciousBlake", "angwaves",
+    "akaidoj", "Pink_Unoriginality", "SpukenderGeist", "Hexagge", "KamilCraft123",
+    "Ihatebloxxed_hotel2", "JohnsonOsborn2", "XKatieKillzX", "NicoOfTheHell", "Johniesplaytime",
+    "KDmaster2107", "That_Guy231242", "radchallenge", "cmperaino1213", "crafty_jayden123456",
+    "Noobgaming565", "sugary3334", "MaskedWarrior36", "Helios458", "TimorousShadow",
+    "DartImperlum", "Franioboss", "LT_Hxro", "cgmhnhgd", "redactedvk",
+    "ComSera", "CelestineKavvyyyyy", "mrgumybears7", "zenith1234567", "Argenos",
+    "Basically_Ren", "Marshium", "smxszk", "CelestineArcturyx", "EndrMOD",
+    "IBI_Gunslinger", "polaskibb", "nypdpolice74", "ArchonFonik", "cj01113",
+    "catritonixx", "nullipotent", "Zind_ex", "Vermelt", "Blaley",
+    "milltary123321", "AFDGHVDV", "SolarisOrbit", "cpt_connor", "Voltronvoltage",
+}
 
 -- ============================ 全局状态 ============================
 local State = {
@@ -56,6 +81,9 @@ local State = {
     AdminTeamKeywords = "联邦,government,federal,admin,moderator,staff",
     HVTeamKeywords = "plantdirector,总监",
     AimbotEnabled = false, AimbotFOV = 120, ShowFOV = true, TargetPart = "Head", AimbotPredict = true, AimbotSpeed = 1000,
+    -- 弹速自动读取（TREK GunConfig）+ 下坠补偿：读不到配置时自动退回上面的手填值
+    -- AimSpeedLiveRead 默认关：实测 require 游戏配置会让枪拿不上，平时只用内置表
+    AimSpeedAuto = true, AimDropComp = true, AimSpeedLiveRead = false,
     AimMaxDist = 1000,
     AimMobileActive = false, NpcAimMobileActive = false,
     -- 打僵尸 / NPC（活动功能，绘制与自瞄各自独立）
@@ -68,7 +96,7 @@ local State = {
     VehicleTurnEnabled = false, VehicleTurnRate = 180, VehiclePushSmooth = 12,
     -- 车辆低空悬浮（只贴地托起，不做自由升降；服务器会检测高度，飞高扣车血）
     VehicleHoverEnabled = false, VehicleHoverHeight = 8, VehicleHoverGain = 8,
-    UserList = {},
+    UserList = MOD_USERNAMES,
     AutoCheck = false, CheckInterval = 5, AutoExit = false, DisableOnAdmin = false,
     WalkSpeedEnabled = false, WalkSpeedValue = 16,
 }
@@ -817,6 +845,285 @@ Track(LocalPlayer.CharacterAdded:Connect(function()
     end
 end))
 end   -- 车辆段结束
+
+-- ============================ 子弹速度自动读取（TREK GunConfig） ============================
+-- 这游戏是 TREK + FastCast 构架：真实弹速不在枪工具上，而是在
+--   ReplicatedStorage.TREK_SERVICES.GunConfigs.Guns.<枪名>[模式].ProjectileVelocity
+-- 而且不少枪名只是"别名模块"（例如 BR-18 的内容其实是 require(D-23 STAR)），
+-- 直接 require 别名会因为它一进门就找 shared.S 而报错，所以要先按源码把别名解开。
+--
+-- 整段包进 do...end：顶层局部变量有 200 个硬上限（见文件头的"修复 11"），
+-- 块内局部变量用完即释放，只留 GunSpeed 一个名字给外面。
+local GunSpeed
+do
+GunSpeed = {
+    cache = {},       -- [枪名] = { speed, accel, distance, mode, module, alias }
+    current = nil,    -- 当前手上这把枪的数据
+    folder = nil,     -- GunConfigs.Guns
+}
+
+-- 硬编码兜底表：探针 2026-11-01 扫出来的 69 把枪。
+-- 格式：["枪名"] = { 弹速 studs/s, 重力, 射程 studs }
+-- 作用：执行器没有 decompile、或者游戏改了配置模块结构时，照样能读对弹速。
+GunSpeed.DB = {
+    ["AB9"] = {4000, 196.2, 1000},
+    ["B63 LMG"] = {4000, 196.2, 5000},
+    ["B9"] = {4000, 196.2, 1000},
+    ["BR-10"] = {4000, 196.2, 5000},
+    ["BR-10 Suppressed"] = {4000, 196.2, 5000},
+    ["BR-10A1"] = {4000, 196.2, 5000},
+    ["BR-177S"] = {4000, 196.2, 1500},
+    ["BR-18"] = {4000, 196.2, 2500},
+    ["BR-18A2"] = {4000, 196.2, 2500},
+    ["BR-18C"] = {4000, 196.2, 1500},
+    ["BR-7"] = {4000, 196.2, 5000},
+    ["BR-PDW"] = {4000, 196.2, 1500},
+    ["Bolterer Fist"] = {3750, 196.2, 2500},
+    ["Bolterer Gun"] = {4000, 196.2, 2500},
+    ["C-11 LMG"] = {4000, 196.2, 5000},
+    ["C-16 GPMG"] = {4000, 196.2, 5000},
+    ["CMP-44"] = {4000, 196.2, 1500},
+    ["CMP-44E1"] = {4000, 196.2, 1500},
+    ["China Lake 40mm"] = {500, 196.2, 300},
+    ["D-19 STAR"] = {4000, 196.2, 5000},
+    ["D-19A1 STAR"] = {4000, 196.2, 5000},
+    ["D-22 STAR"] = {4000, 196.2, 5000},
+    ["D-23 STAR"] = {4000, 196.2, 2500},
+    ["D-23 Spectre"] = {4000, 196.2, 2500},
+    ["D-23FM"] = {4000, 196.2, 2500},
+    ["D-23SD"] = {4000, 196.2, 2500},
+    ["DA-21"] = {4000, 196.2, 1000},
+    ["DA-21 Suppressed"] = {4000, 196.2, 1000},
+    ["DX-21"] = {4000, 196.2, 1000},
+    ["DX-9000"] = {4000, 196.2, 1000},
+    ["ED-23"] = {4000, 196.2, 6000},
+    ["ED-23H"] = {4000, 196.2, 2500},
+    ["Ellan L1"] = {750, 20, 5000},
+    ["Falkenkreuz"] = {500, 196.2, 1000},
+    ["HEAVY BOLTER"] = {4000, 196.2, 2500},
+    ["HEAVY LASGUN"] = {4000, 196.2, 2500},
+    ["Jerico SMG"] = {4000, 196.2, 1500},
+    ["Jerico SMG-S"] = {4000, 196.2, 1500},
+    ["Lasgun"] = {4500, 196.2, 2500},
+    ["Lewis Gun"] = {4000, 196.2, 3000},
+    ["M-16"] = {600, 196.2, 1000},
+    ["M-23"] = {500, 196.2, 1000},
+    ["M-24"] = {500, 196.2, 1000},
+    ["M16A1"] = {4000, 196.2, 2500},
+    ["M19"] = {4000, 196.2, 1000},
+    ["M19 Suppressed"] = {4000, 196.2, 1000},
+    ["M80 AMR"] = {3500, 0, 5000},
+    ["Model 117"] = {4000, 196.2, 1000},
+    ["Model 17"] = {4000, 196.2, 1000},
+    ["Münzwurf"] = {500, 196.2, 1000},
+    ["PAT-1"] = {500, 20, 5000},
+    ["PAT-1 Test"] = {500, 20, 5000},
+    ["PDW-18"] = {4000, 196.2, 1500},
+    ["PSAT"] = {750, 20, 5000},
+    ["Plasma Pistol"] = {4000, 196.2, 2500},
+    ["Projectile Tester"] = {4000, 196.2, 1000},
+    ["R72"] = {500, 20, 5000},
+    ["Springton Pattern Lasgun"] = {4500, 196.2, 2500},
+    ["Super Bazooka"] = {600, 10, 5000},
+    ["T-29 Springbolt"] = {5000, 196.2, 4000},
+    ["T-3"] = {500, 196.2, 1000},
+    ["T-3 Suppressed"] = {500, 196.2, 1000},
+    ["T-42 Matchbox"] = {4000, 196.2, 5000},
+    ["The Sleeper Agent"] = {100, 1.96, 1000},
+    ["Weston Ranger"] = {4000, 196.2, 1500},
+    ["Weston SMG"] = {4000, 196.2, 1500},
+    ["Weston SMG-S"] = {4000, 196.2, 1500},
+    ["XD-23H"] = {4000, 196.2, 1500},
+    ["XD-23M"] = {4000, 196.2, 2500},
+}
+
+function GunSpeed.Folder()
+    if GunSpeed.folder and GunSpeed.folder.Parent then return GunSpeed.folder end
+    local rs = game:GetService("ReplicatedStorage")
+    local ts = rs:FindFirstChild("TREK_SERVICES")
+    local gc = ts and ts:FindFirstChild("GunConfigs")
+    GunSpeed.folder = gc and gc:FindFirstChild("Guns")
+    return GunSpeed.folder
+end
+
+-- 解别名：别名模块的源码长这样
+--   local v1 = shared.S.GunConfigs:FindFirstChild("Guns"):FindFirstChild("D-23 STAR", true)
+--   return require(v1)
+function GunSpeed.ResolveAlias(mod, depth)
+    depth = depth or 0
+    if depth > 3 or not mod then return mod end
+    if type(decompile) ~= "function" then return mod end
+    local ok, src = pcall(decompile, mod)
+    if not ok or type(src) ~= "string" or #src > 4000 then return mod end
+
+    local target = nil
+    for name in string.gmatch(src, "FindFirstChild%(%s*[\"']([^\"']+)[\"']%s*,[%s]*true%s*%)") do
+        target = name
+    end
+    if not target then return mod end
+
+    local guns = GunSpeed.Folder()
+    local nextMod = guns and guns:FindFirstChild(target)
+    if not nextMod then
+        local okd, desc = pcall(function() return guns and guns:GetDescendants() or {} end)
+        if okd then
+            for _, d in ipairs(desc) do
+                if d:IsA("ModuleScript") and string.lower(d.Name) == string.lower(target) then
+                    nextMod = d
+                    break
+                end
+            end
+        end
+    end
+    if nextMod and nextMod:IsA("ModuleScript") and nextMod ~= mod then
+        return GunSpeed.ResolveAlias(nextMod, depth + 1)
+    end
+    return mod
+end
+
+-- 从游戏配置里实读（需要 require；别名还要 decompile）。读不到返回 nil
+function GunSpeed.ReadLive(toolName)
+    local guns = GunSpeed.Folder()
+    if not guns or not toolName then return nil end
+
+    local mod = guns:FindFirstChild(toolName)
+    if not mod then
+        -- 大小写/空格差异也认（直接列子项，不用递归 FindFirstChild）
+        local okd, desc = pcall(function() return guns:GetDescendants() end)
+        if okd then
+            for _, d in ipairs(desc) do
+                if d:IsA("ModuleScript") and string.lower(d.Name) == string.lower(toolName) then
+                    mod = d
+                    break
+                end
+            end
+        end
+    end
+    if not mod or not mod:IsA("ModuleScript") then return nil end
+
+    local real = GunSpeed.ResolveAlias(mod, 0)
+    local ok, cfg = pcall(require, real)
+    if not ok or type(cfg) ~= "table" then return nil end
+
+    local m1 = cfg[1]
+    if type(m1) ~= "table" then
+        if type(cfg.ProjectileVelocity) ~= "number" then return nil end
+        m1 = cfg
+    end
+    if type(m1.ProjectileVelocity) ~= "number" then return nil end
+
+    local info = {
+        speed = m1.ProjectileVelocity,
+        distance = m1.Distance,
+        mode = "1",
+        module = real:GetFullName(),
+        alias = (real ~= mod) and real.Name or nil,
+    }
+    local accel = m1.ProjectileAcceleration
+    if typeof(accel) == "Vector3" then info.accel = accel.Magnitude end
+
+    GunSpeed.cache[toolName] = info
+    return info
+end
+
+-- 查硬编码表（大小写不敏感）
+function GunSpeed.LookupDB(toolName)
+    if not toolName then return nil end
+    local v = GunSpeed.DB[toolName]
+    if not v then
+        local want = string.lower(toolName)
+        for name, val in pairs(GunSpeed.DB) do
+            if string.lower(name) == want then v = val; break end
+        end
+    end
+    return v
+end
+
+-- 对外统一入口：**先查内置表**（不碰游戏模块，最安全）。
+-- 内置表里没有（新枪/改名）才考虑实读，而且必须手动打开 State.AimSpeedLiveRead ——
+-- 实测发现 require 游戏配置会让枪拿不上，所以实读默认关闭。
+function GunSpeed.Read(toolName)
+    local db = GunSpeed.LookupDB(toolName)
+    if db then
+        local info = {
+            speed = db[1],
+            accel = db[2],
+            distance = db[3],
+            mode = "1",
+            source = "db",
+        }
+        GunSpeed.cache[toolName] = info
+        return info
+    end
+
+    if State.AimSpeedLiveRead then
+        local live = GunSpeed.ReadLive(toolName)
+        if live then return live end
+    end
+
+    return nil
+end
+
+function GunSpeed.Refresh(toolName)
+    if not toolName then
+        GunSpeed.current = nil
+        return
+    end
+    local info = GunSpeed.cache[toolName] or GunSpeed.Read(toolName)
+    GunSpeed.current = info
+
+    if info and info.speed then
+        local from = (info.source == "db") and "，内置表"
+            or (info.alias and ("，别名→" .. info.alias) or "")
+        print(string.format("[NARAMO] 弹速自动读取: %s = %d studs/s（重力 %.1f，射程 %s）%s",
+            tostring(toolName), math.floor(info.speed + 0.5), info.accel or 0,
+            tostring(info.distance or "?"), from))
+        -- 顺手把滑块同步成真值，面板上能直接看到（超出 100~5000 会被夹住，不影响实际计算）
+        if State.AimSpeedAuto then
+            pcall(SetControl, "AimbotSpeed", math.floor(info.speed + 0.5))
+        end
+    elseif State.AimSpeedAuto then
+        print("[NARAMO] 弹速自动读取: " .. tostring(toolName)
+            .. " 没读到配置，退回手填 " .. tostring(State.AimbotSpeed))
+    end
+end
+
+-- 枪口位置：优先枪管，退回相机（相机在脑袋后面，近距离差得出来）
+-- 注意：这里全部用非递归 FindFirstChild —— 这个执行器上递归查找不可靠
+function GunSpeed.Muzzle()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then
+        local barrel = tool:FindFirstChild("Barrel") or tool:FindFirstChild("Main")
+        if barrel and barrel:IsA("BasePart") then return barrel.Position end
+        local handle = tool:FindFirstChild("Handle")
+        if handle and handle:IsA("BasePart") then return handle.Position end
+    end
+    return workspace.CurrentCamera.CFrame.Position
+end
+
+-- 换枪 / 重生都重读一次
+local function watchTool(container)
+    if not container then return end
+    Track(container.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            task.delay(0.35, function() GunSpeed.Refresh(child.Name) end)
+        end
+    end))
+end
+
+watchTool(LocalPlayer.Character)
+Track(LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(1)
+    if IsClosing or not char then return end
+    watchTool(char)
+    local tool = char:FindFirstChildOfClass("Tool")
+    GunSpeed.Refresh(tool and tool.Name)
+end))
+
+-- 方便在控制台核对：getgenv().NARAMO_GUNSPEED.current 就是当前这把枪的数据
+pcall(function() getgenv().NARAMO_GUNSPEED = GunSpeed end)
+end   -- 弹速段结束
 
 local function DisableAllFeatures()
     for _, key in ipairs({ "InfJump", "Noclip", "FullBright", "ESPEnabled", "AimbotEnabled",
@@ -2212,6 +2519,25 @@ CreateSlider(AimbotPage, "FOV 范围", "AimbotFOV", 20, 500, State.AimbotFOV, fu
 CreateSlider(AimbotPage, "最远自瞄距离 (studs)", "AimMaxDist", 50, 5000, State.AimMaxDist, function(v) State.AimMaxDist = v end)
 CreateToggle(AimbotPage, "移动预判", "AimbotPredict", State.AimbotPredict, function(v) State.AimbotPredict = v end)
 CreateSlider(AimbotPage, "子弹速度", "AimbotSpeed", 100, 5000, State.AimbotSpeed, function(v) State.AimbotSpeed = v end)
+-- 自动读取 TREK GunConfig 里的 ProjectileVelocity，换枪自动更新；读不到就沿用手填的滑块
+CreateToggle(AimbotPage, "自动读取弹速 (TREK GunConfig)", "AimSpeedAuto", State.AimSpeedAuto, function(v)
+    State.AimSpeedAuto = v
+    if v then
+        local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        GunSpeed.Refresh(tool and tool.Name)
+    end
+end)
+-- 按 GunConfig 里的 ProjectileAcceleration（这个游戏是 -196.2）补下坠
+CreateToggle(AimbotPage, "下坠补偿 (按 GunConfig 重力)", "AimDropComp", State.AimDropComp, function(v) State.AimDropComp = v end)
+-- 默认只用内置表；这个开关是给"内置表里没有的新枪"用的，开了会去 require 游戏配置
+CreateToggle(AimbotPage, "实读游戏配置 (仅新枪，可能影响拿枪)", "AimSpeedLiveRead", State.AimSpeedLiveRead, function(v)
+    State.AimSpeedLiveRead = v
+    if v then
+        local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if tool then GunSpeed.cache[tool.Name] = nil end
+        GunSpeed.Refresh(tool and tool.Name)
+    end
+end)
 
 -- 打僵尸 / NPC 页面（活动期间用；绘制与自瞄是两个独立开关，互不依赖）
 local NpcPage = CreatePage("打僵尸")
@@ -3095,12 +3421,35 @@ Track(RunService.RenderStepped:Connect(function()
     end
 end))
 
+-- 移动预判：从"直线领先"升级成"抛物线解算"
+--   1) 速度优先用 GunConfig 读到的 ProjectileVelocity（换枪自动更新），读不到才用滑块
+--   2) 起点用枪口（枪管）而不是相机，近距离差异明显
+--   3) 按 ProjectileAcceleration（这游戏是 -196.2）补下坠，迭代 3 次收敛
 local function GetPredictPosition(part)
     if not State.AimbotPredict then return part.Position end
-    local distance = (part.Position - workspace.CurrentCamera.CFrame.Position).Magnitude
-    local travelTime = distance / State.AimbotSpeed
-    local vel = part.AssemblyLinearVelocity or Vector3.new(0,0,0)
-    return part.Position + (vel * travelTime)
+
+    local speed = State.AimbotSpeed
+    local info = GunSpeed.current
+    if State.AimSpeedAuto and info and info.speed and info.speed > 0 then
+        speed = info.speed
+    end
+    if not speed or speed <= 0 then return part.Position end
+
+    local origin = GunSpeed.Muzzle()
+    local targetPos = part.Position
+    local vel = part.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+    local gravity = 0
+    if State.AimDropComp and info and info.accel then gravity = info.accel end
+
+    local aim = targetPos
+    for _ = 1, 3 do
+        local travelTime = (aim - origin).Magnitude / speed
+        aim = targetPos + vel * travelTime
+        if gravity > 0 then
+            aim = aim + Vector3.new(0, 0.5 * gravity * travelTime * travelTime, 0)
+        end
+    end
+    return aim
 end
 
 local function GetClosestTarget()
