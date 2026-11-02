@@ -21,6 +21,15 @@
 --          内置管理员用户名名单（mod.txt 里带 @ 的那些真实用户名）作为反管理默认名单
 -- 修复 18: 弹速改为"内置表优先"，实读游戏配置降级为手动开关（默认关）——
 --          实测 require 游戏配置后枪会拿不上，不能让它跟着换枪自动跑
+-- 新增 19: 「反管理」新增自动重置角色 —— 检测到管理员时本地重置角色
+--          （断关节 / 血量归零 / Dead 状态三套兜底，上一套不生效还有下一套），
+--          同一个管理员只触发一次（连开三轮回合都没再扫到才算离开，离开后再进来会重新触发）
+-- 新增 20: 「反管理」检测到管理员时右下角常驻弹窗「检测到管理员: 名字」；
+--          自动退服的 Kick 信息里也带上管理员名字；绘制管理员的判定同时认「管理员名单」，
+--          管理员（队伍判定 + 名单判定）统一画成灰色；「高价值目标」改名为「植物总监」
+-- 新增 21: 「主要」页新增反挂机 —— 固定每 19 分钟模拟一次鼠标左键点击（VirtualInputManager /
+--          mouse1click / VirtualUser 三套兜底），刷新闲置计时，防止 20 分钟没输入被服务器踢；
+--          另外监听 Idled 事件再补一次点击兜底
 -- ============================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -34,7 +43,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-01 r45 · 弹速改为内置表优先 / 实读改为手动开关"
+local SCRIPT_VERSION = "2026-11-03 r49 · 反挂机固定每 19 分钟模拟点击（无间隔滑块）"
 
 -- ============================ 内置管理员名单 ============================
 -- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
@@ -75,7 +84,7 @@ local State = {
     ESPEnabled = false, ESPBox = true, ESPName = true, ESPDistance = true, ESPHealth = true, ESPTracer = true, ESPHighlight = false, ESPColorIdx = 1,
     ESPMaxDist = 1000,
     ESPTeammates = false,
-    -- 队伍检测（管理 / 高价值目标）
+    -- 队伍检测（管理 / 植物总监）
     -- 这游戏的小队伍在玩家属性 Unit / SubUnit 里，不在 Teams 服务
     TeamHighlightEnabled = true, TeamNotifyEnabled = true,
     AdminTeamKeywords = "联邦,government,federal,admin,moderator,staff",
@@ -98,7 +107,13 @@ local State = {
     VehicleHoverEnabled = false, VehicleHoverHeight = 8, VehicleHoverGain = 8,
     UserList = MOD_USERNAMES,
     AutoCheck = false, CheckInterval = 5, AutoExit = false, DisableOnAdmin = false,
+    -- 检测到管理员时自动重置角色（本地重置：断关节 + 血量归零 + Dead 状态）
+    AutoResetChar = false,
+    -- 检测到管理员时，右下角常驻弹窗提示（管理员还在就一直显示）
+    AdminPopup = true,
     WalkSpeedEnabled = false, WalkSpeedValue = 16,
+    -- 反挂机：固定每 19 分钟模拟一次鼠标点击，防止「闲置 20 分钟被服务器踢掉」
+    AntiIdle = false,
 }
 
 local Colors = {
@@ -110,6 +125,14 @@ local TEAMMATE_COLOR = Color3.fromRGB(80, 230, 120)   -- 队友专用色
 
 local ESPObjects = {}
 local AutoCheckThread = nil
+
+-- 反管理：自动重置角色的记录表。
+-- 顶层局部变量有 200 个硬上限，所以这里只占 1 个名字，具体函数在「反管理」页里赋值到表上。
+--   done        [小写名字] = true，这一轮已经触发过重置的管理员（防止同一个人无限触发）
+--   pending     正在等角色重生，8 秒内不再重复重置
+--   lastAt      上一次触发重置的时间（os.clock）
+--   emptyPasses 连续几轮没扫到管理员（连续 3 轮才认为管理员走了，清空 done）
+local AdminGuard = { done = {}, pending = false, lastAt = 0, emptyPasses = 0 }
 local AmmoTables = {}
 local AmmoBackup = {}
 local CONFIG_FOLDER = "NARAMO_Configs"
@@ -2022,7 +2045,7 @@ local function CleanupAndClose()
     -- 1) 所有开关回到默认（走控件回填，界面同步）
     for _, key in ipairs({ "InfJump", "Noclip", "FullBright", "UnlockChat", "UnlockFPS",
                           "ESPEnabled", "AimbotEnabled", "NPCESPEnabled", "NPCAimEnabled",
-                          "WalkSpeedEnabled", "InfiniteAmmo",
+                          "WalkSpeedEnabled", "InfiniteAmmo", "AntiIdle",
                           "InstantInteract", "WrenchRepair", "WrenchAutoRepair", "SkyWalk",
                           "VehiclePushEnabled", "VehicleTurnEnabled", "VehicleHoverEnabled", "WrenchTour" }) do
         SetControl(key, false)
@@ -2491,6 +2514,110 @@ CreateToggle(MainPage, "弹药兼容模式(只轮询,不动元表)", "AmmoPollOn
     end
 end)
 
+-- ============================ 反挂机 ============================
+-- Roblox 的闲置踢人是「20 分钟没有任何输入」就踢，这里固定每 19 分钟模拟一次鼠标左键点击，
+-- 点击走客户端的输入管线，闲置计时器会被刷新，人挂着不动也不会被踢。
+-- 包成 do...end：线程句柄、点击函数都是段内局部变量，用完即释放，不占顶层 200 个名额。
+do
+    local AntiIdleThread = nil
+    local IdleConn = nil
+    local ANTI_IDLE_INTERVAL = 19     -- 固定 19 分钟（服务器 20 分钟闲置踢人）
+
+    -- 模拟一次鼠标左键点击。不同执行器能力不一样，按可靠程度依次退：
+    --   1) VirtualInputManager（引擎级输入，InputBegan 会真的触发，最通用）
+    --   2) 执行器自带的 mouse1click / mouse1press+mouse1release
+    --   3) VirtualUser（老式反挂机脚本的写法，CaptureController + ClickButton）
+    local function ClickOnce()
+        -- 点击点固定在屏幕左下角：避开我们自己的面板 / 右下角弹窗 / 右侧移动端按钮。
+        -- 不用当前鼠标位置 —— 刚点完开关时鼠标正压在面板上，19 分钟后会把自己的开关点掉。
+        local vp = Vector2.new(1920, 1080)
+        pcall(function() vp = workspace.CurrentCamera.ViewportSize end)
+        local x = 10
+        local y = math.max(10, math.floor(vp.Y) - 20)
+
+        -- 1) VirtualInputManager
+        local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+        if okVim and vim then
+            local okClick = pcall(function()
+                vim:SendMouseMoveEvent(x, y, game)
+                vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                task.wait(0.05)
+                vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            end)
+            if okClick then return true, "VirtualInputManager" end
+        end
+
+        -- 2) 执行器全局函数
+        local okFn, fn = pcall(function() return mouse1click end)
+        if okFn and type(fn) == "function" then
+            local okClick = pcall(fn)
+            if okClick then return true, "mouse1click" end
+        end
+        local okPress, press = pcall(function() return mouse1press end)
+        local okRelease, release = pcall(function() return mouse1release end)
+        if okPress and okRelease and type(press) == "function" and type(release) == "function" then
+            local okClick = pcall(function()
+                press()
+                task.wait(0.05)
+                release()
+            end)
+            if okClick then return true, "mouse1press/mouse1release" end
+        end
+
+        -- 3) VirtualUser：老式反挂机脚本的保底写法
+        local okVu, vu = pcall(function() return game:GetService("VirtualUser") end)
+        if okVu and vu then
+            local okClick = pcall(function()
+                vu:CaptureController()
+                vu:ClickButton1(Vector2.new(x, y))
+            end)
+            if okClick then return true, "VirtualUser" end
+        end
+
+        return false, nil
+    end
+
+    local function StopLoop()
+        if AntiIdleThread then pcall(task.cancel, AntiIdleThread); AntiIdleThread = nil end
+    end
+
+    local function StartLoop()
+        StopLoop()
+        AntiIdleThread = TrackThread(task.spawn(function()
+            while State.AntiIdle and not IsClosing do
+                task.wait(ANTI_IDLE_INTERVAL * 60)   -- 先等再点：刚开启的那一下不会误触游戏
+                if not State.AntiIdle or IsClosing then break end
+                local ok, how = ClickOnce()
+                if ok then
+                    print("[NARAMO] 反挂机: 已模拟鼠标点击（" .. tostring(how) .. "），闲置计时器已刷新")
+                else
+                    print("[NARAMO] 反挂机: 模拟点击失败（这个执行器不支持 VirtualInputManager / mouse1click），下一轮再试")
+                end
+            end
+            AntiIdleThread = nil
+        end))
+    end
+
+    CreateToggle(MainPage, "反挂机 (定时模拟鼠标点击)", "AntiIdle", State.AntiIdle, function(v)
+        State.AntiIdle = v
+        if v then
+            -- 兜底：万一哪次点击没送到、真触发了 20 分钟闲置踢人，Idled 事件里再补一次
+            if not IdleConn and LocalPlayer.Idled then
+                IdleConn = Track(LocalPlayer.Idled:Connect(function()
+                    if IsClosing or not State.AntiIdle then return end
+                    ClickOnce()
+                end))
+            end
+            StartLoop()
+            print("[NARAMO] 反挂机: 已开启，每 " .. tostring(ANTI_IDLE_INTERVAL) .. " 分钟模拟一次鼠标点击")
+        else
+            local wasRunning = AntiIdleThread ~= nil
+            StopLoop()
+            if wasRunning then print("[NARAMO] 反挂机: 已关闭") end
+        end
+    end)
+end
+
 -- 绘制页面
 local DrawPage = CreatePage("绘制")
 CreateToggle(DrawPage, "开启绘制", "ESPEnabled", State.ESPEnabled, function(v) State.ESPEnabled = v end)
@@ -2590,15 +2717,15 @@ CreateSlider(VehiclePage, "悬浮高度 (越高越容易被检测)", "VehicleHov
 end)
 CreateSlider(VehiclePage, "悬浮跟随速度 (越大贴地越紧)", "VehicleHoverGain", 2, 20, State.VehicleHoverGain, function(v) State.VehicleHoverGain = v end)
 
--- 队伍页面（管理 / 高价值目标）
+-- 队伍页面（管理 / 植物总监）
 local TeamPage = CreatePage("队伍")
-CreateToggle(TeamPage, "重点目标高亮 (管理/高价值)", "TeamHighlightEnabled", State.TeamHighlightEnabled, function(v) State.TeamHighlightEnabled = v end)
+CreateToggle(TeamPage, "重点目标高亮 (管理/植物总监)", "TeamHighlightEnabled", State.TeamHighlightEnabled, function(v) State.TeamHighlightEnabled = v end)
 CreateToggle(TeamPage, "发现时打印提示", "TeamNotifyEnabled", State.TeamNotifyEnabled, function(v) State.TeamNotifyEnabled = v end)
 local adminKwBox = CreateInput(TeamPage, "管理员队伍关键词(逗号分隔)", function(text)
     State.AdminTeamKeywords = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end)
 adminKwBox.Text = State.AdminTeamKeywords
-local hvKwBox = CreateInput(TeamPage, "高价值队伍关键词(逗号分隔)", function(text)
+local hvKwBox = CreateInput(TeamPage, "植物总监队伍关键词(逗号分隔)", function(text)
     State.HVTeamKeywords = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end)
 hvKwBox.Text = State.HVTeamKeywords
@@ -2608,10 +2735,8 @@ local AdminPage = CreatePage("反管理")
 
 -- 判断某玩家是不是管理员：名字在名单里，或者 Unit/队伍命中管理员关键词（比如"联邦政府"）
 local function IsAdminPlayer(player)
-    for _, target in ipairs(State.UserList) do
-        if string.lower(player.Name) == string.lower(target) then
-            return true, "名单"
-        end
+    if AdminGuard.IsListed(player.Name) then
+        return true, "名单"
     end
     -- 队伍判定函数在脚本后半段才赋值，配置自动加载时可能还没就绪，这里做个保护
     if type(GetPlayerTeamText) == "function" and type(MatchKeywords) == "function" then
@@ -2623,24 +2748,209 @@ local function IsAdminPlayer(player)
     return false, nil
 end
 
+-- ============ 反管理：检测到管理员时自动重置角色 ============
+-- 重置走客户端最通用的三套写法，上一套被游戏挡住时还有下一套：
+--   1) Character:BreakJoints()         —— 断关节，等价于点游戏里的「重置角色」按钮
+--   2) Humanoid.Health = 0             —— 关节被锁、断不开时的备选
+--   3) ChangeState(Dead) / TakeDamage  —— 血量被写保护时的最后手段
+-- 角色死亡后的重生由游戏服务端负责，这里只负责"把本地角色弄死"这一步。
+function AdminGuard.Reset(reason)
+    if IsClosing then return false end
+
+    local now = os.clock()
+    -- 正在等重生（8 秒内）就不重复重置：同一轮扫到好几个管理员也只重置一次
+    if AdminGuard.pending and (now - AdminGuard.lastAt) < 8 then
+        print("[NARAMO] 重置角色: 上一次重置还在等重生，跳过")
+        return false
+    end
+
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not hum then
+        print("[NARAMO] 重置角色: 当前没有可重置的角色，跳过")
+        return false
+    end
+
+    AdminGuard.pending = true
+    AdminGuard.lastAt = now
+
+    pcall(function() char:BreakJoints() end)
+    pcall(function() hum.Health = 0 end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+    pcall(function() hum:TakeDamage(math.max(hum.Health, hum.MaxHealth)) end)
+
+    print("[NARAMO] 重置角色: 已触发（" .. tostring(reason) .. "）")
+
+    -- 重生回调：拿到新角色才算重置成功，同时解除 pending（新角色上功能会自动恢复）
+    local conn
+    conn = LocalPlayer.CharacterAdded:Connect(function()
+        if conn then pcall(function() conn:Disconnect() end) end
+        if AdminGuard.pending then
+            AdminGuard.pending = false
+            print("[NARAMO] 重置角色: 已重生")
+        end
+    end)
+    Track(conn)
+
+    -- 兜底：8 秒内没等到重生也要放开 pending，否则以后永远不再触发重置
+    task.delay(8, function()
+        if conn then pcall(function() conn:Disconnect() end) end
+        AdminGuard.pending = false
+    end)
+    return true
+end
+
+-- 管理员名单的小写索引：绘制时每帧都要判断"这个名字在不在名单里"，
+-- 直接遍历 60 个名字再 string.lower 会一直产生垃圾，这里在名单变动时重建一次。
+function AdminGuard.RefreshNameSet()
+    local set = {}
+    for _, name in ipairs(State.UserList) do
+        if type(name) == "string" then set[string.lower(name)] = true end
+    end
+    AdminGuard.nameSet = set
+    return set
+end
+
+function AdminGuard.IsListed(playerName)
+    if type(playerName) ~= "string" then return false end
+    local set = AdminGuard.nameSet
+    if not set then                    -- 索引还没建（脚本刚起来）时退回直接扫名单
+        for _, name in ipairs(State.UserList) do
+            if type(name) == "string" and string.lower(name) == string.lower(playerName) then
+                return true
+            end
+        end
+        return false
+    end
+    return set[string.lower(playerName)] == true
+end
+
+-- ============ 右下角管理员提示框（检测到管理员时一直挂在屏幕右下角） ============
+-- 包成 do...end：段内局部变量用完即释放，不占顶层 200 个名额。
+do
+    local frame = Instance.new("Frame")
+    frame.Name = "NARAMO_AdminAlert"
+    frame.AnchorPoint = Vector2.new(1, 1)
+    frame.Position = UDim2.new(1, -16, 1, -16)
+    frame.Size = UDim2.new(0, 320, 0, 0)
+    frame.AutomaticSize = Enum.AutomaticSize.Y
+    frame.BackgroundColor3 = Color3.fromRGB(40, 16, 16)
+    frame.BackgroundTransparency = 0.08
+    frame.BorderSizePixel = 0
+    frame.Visible = false
+    frame.ZIndex = 60
+    frame.Parent = ScreenGui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Color = Color3.fromRGB(255, 90, 80)
+    stroke.Thickness = 1
+    stroke.Transparency = 0.3
+
+    local layout = Instance.new("UIListLayout", frame)
+    layout.Padding = UDim.new(0, 4)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local pad = Instance.new("UIPadding", frame)
+    pad.PaddingTop = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingLeft = UDim.new(0, 10)
+    pad.PaddingRight = UDim.new(0, 10)
+
+    AdminGuard.popupFrame = frame
+end
+
+-- names 传空表/不传 = 收起弹窗。内容没变就不重建控件，避免每轮检测都闪一下。
+function AdminGuard.UpdatePopup(names)
+    local frame = AdminGuard.popupFrame
+    if not frame then return end
+    names = names or {}
+    AdminGuard.lastNames = names
+
+    if not State.AdminPopup or #names == 0 then
+        frame.Visible = false
+        return
+    end
+
+    local key = table.concat(names, "|")
+    if AdminGuard.popupKey ~= key then
+        for _, child in ipairs(frame:GetChildren()) do
+            if child:IsA("TextLabel") then child:Destroy() end
+        end
+        for i, name in ipairs(names) do
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, 0, 0, 0)
+            lbl.AutomaticSize = Enum.AutomaticSize.Y
+            lbl.BackgroundTransparency = 1
+            lbl.Font = Enum.Font.GothamBold
+            lbl.TextSize = 14
+            lbl.TextWrapped = true
+            lbl.TextXAlignment = Enum.TextXAlignment.Left
+            lbl.TextYAlignment = Enum.TextYAlignment.Top
+            lbl.TextColor3 = Color3.fromRGB(255, 120, 110)
+            lbl.Text = "检测到管理员: " .. tostring(name)
+            lbl.LayoutOrder = i
+            lbl.Parent = frame
+        end
+        AdminGuard.popupKey = key
+    end
+    frame.Visible = true
+end
+
 CreateToggle(AdminPage, "自动检测管理员", "AutoCheck", State.AutoCheck, function(v)
     State.AutoCheck = v
     if AutoCheckThread then pcall(task.cancel, AutoCheckThread); AutoCheckThread = nil end
+    if not v then
+        table.clear(AdminGuard.done)                  -- 关掉再开，管理员可以重新触发重置
+        AdminGuard.UpdatePopup({})                    -- 关掉检测就把右下角弹窗一起收起
+    end
     if v then
         AutoCheckThread = task.spawn(function()
             while State.AutoCheck and not IsClosing do
-                local foundName, foundWhy = nil, nil
+                -- 本轮扫到的所有管理员（名字 + 判定来源）
+                local found = {}
                 for _, p in ipairs(Players:GetPlayers()) do
                     if p ~= LocalPlayer then
                         local okCall, isAdmin, why = pcall(IsAdminPlayer, p)
-                        if okCall and isAdmin then foundName, foundWhy = p.Name, why; break end
+                        if okCall and isAdmin then table.insert(found, { name = p.Name, why = why }) end
                     end
                 end
 
-                if foundName then
-                    print(string.format("[NARAMO] 检测到管理员: %s（来源: %s）", foundName, tostring(foundWhy)))
+                if #found > 0 then
+                    AdminGuard.emptyPasses = 0
+                    local names = {}
+                    for _, info in ipairs(found) do
+                        table.insert(names, info.name)
+                        print(string.format("[NARAMO] 检测到管理员: %s（来源: %s）", info.name, tostring(info.why)))
+                    end
+                    -- 右下角常驻弹窗：每个管理员一行「检测到管理员: 名字」
+                    AdminGuard.UpdatePopup(names)
                     if State.DisableOnAdmin then DisableAllFeatures() end
-                    if State.AutoExit then LocalPlayer:Kick("Admin Detected") end
+                    -- 退服信息里也带上管理员名字（多个管理员用逗号隔开）
+                    if State.AutoExit then LocalPlayer:Kick("Admin Detected: " .. table.concat(names, ", ")) end
+
+                    -- 自动重置角色：同一个管理员只触发一次，避免站在管理员面前无限重生
+                    if State.AutoResetChar then
+                        local freshNames = {}
+                        for _, info in ipairs(found) do
+                            local key = string.lower(info.name)
+                            if not AdminGuard.done[key] then
+                                AdminGuard.done[key] = true
+                                table.insert(freshNames, info.name)
+                            end
+                        end
+                        if #freshNames > 0 then
+                            AdminGuard.Reset("检测到管理员 " .. table.concat(freshNames, ", "))
+                        end
+                    end
+                else
+                    AdminGuard.UpdatePopup({})            -- 没有管理员：收起右下角弹窗
+                    -- 连续 3 轮没扫到才认为管理员走了：刚进服时队伍信息可能还没同步好，
+                    -- 单轮没扫到就清空记录会导致来回重置
+                    AdminGuard.emptyPasses = AdminGuard.emptyPasses + 1
+                    if AdminGuard.emptyPasses >= 3 and next(AdminGuard.done) then
+                        table.clear(AdminGuard.done)
+                    end
                 end
                 task.wait(State.CheckInterval)
             end
@@ -2650,6 +2960,14 @@ CreateToggle(AdminPage, "自动检测管理员", "AutoCheck", State.AutoCheck, f
 end)
 CreateToggle(AdminPage, "发现管理时关闭所有功能", "DisableOnAdmin", State.DisableOnAdmin, function(v) State.DisableOnAdmin = v end)
 CreateToggle(AdminPage, "发现管理时自动退服", "AutoExit", State.AutoExit, function(v) State.AutoExit = v end)
+CreateToggle(AdminPage, "发现管理时自动重置角色", "AutoResetChar", State.AutoResetChar, function(v)
+    State.AutoResetChar = v
+    if not v then table.clear(AdminGuard.done) end    -- 关掉再开可以重新触发
+end)
+CreateToggle(AdminPage, "发现管理员时右下角弹窗", "AdminPopup", State.AdminPopup, function(v)
+    State.AdminPopup = v
+    AdminGuard.UpdatePopup(AdminGuard.lastNames or {})
+end)
 CreateSlider(AdminPage, "检测间隔 (秒)", "CheckInterval", 1, 60, State.CheckInterval, function(v) State.CheckInterval = v end)
 
 -- 手动管理员名单（点击名字可移除）
@@ -2670,6 +2988,7 @@ adminListPad.PaddingLeft = UDim.new(0, 6)
 adminListPad.PaddingRight = UDim.new(0, 6)
 
 local function RefreshAdminList()
+    AdminGuard.RefreshNameSet()   -- 名单变了，绘制用的索引也跟着重建
     for _, child in ipairs(AdminListFrame:GetChildren()) do
         if child:IsA("TextButton") or child:IsA("TextLabel") then child:Destroy() end
     end
@@ -2993,7 +3312,7 @@ TrackThread(task.spawn(function()
     end
 end))
 
--- ============================ 队伍识别（管理 / 高价值目标） ============================
+-- ============================ 队伍识别（管理 / 植物总监） ============================
 -- Roblox 原生的 player.Team + 玩家/角色身上的 Attribute 都可能是队伍信息
 local TeamTextCache = {}
 
@@ -3039,7 +3358,8 @@ MatchKeywords = function(text, keywords)
 end
 
 -- 返回 标签, 特殊颜色
-local ADMIN_COLOR = Color3.fromRGB(255, 60, 60)
+-- 管理（不管是队伍判出来的，还是管理员名单里的）统一灰色；植物总监保留金色
+local ADMIN_COLOR = Color3.fromRGB(160, 160, 160)
 local HV_COLOR = Color3.fromRGB(255, 200, 40)
 local TaggedSeen = {}
 
@@ -3047,11 +3367,16 @@ GetPlayerTag = function(player)
     if not State.TeamHighlightEnabled then return "", nil end
     local text = GetPlayerTeamText(player)
 
+    -- 管理员有两种来源：队伍/Unit 命中管理关键词，或者名字在「反管理」的手动名单里。
+    -- 名单里的管理员原来只在自动检测里用，这里也一起画出来（灰色），不然看不见人。
+    local isAdmin = MatchKeywords(text, State.AdminTeamKeywords)
+    if not isAdmin then isAdmin = AdminGuard.IsListed(player.Name) end
+
     local tag, color, kind
-    if MatchKeywords(text, State.AdminTeamKeywords) then
+    if isAdmin then
         tag, color, kind = " [管理]", ADMIN_COLOR, "管理"
     elseif MatchKeywords(text, State.HVTeamKeywords) then
-        tag, color, kind = " [高价值]", HV_COLOR, "高价值"
+        tag, color, kind = " [植物总监]", HV_COLOR, "植物总监"
     else
         return "", nil
     end
@@ -3086,7 +3411,7 @@ Track(RunService.RenderStepped:Connect(function()
         local char = player.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
 
-        -- 管理 / 高价值目标：特殊颜色 + 名称后缀，且即使同队也画
+        -- 管理 / 植物总监：特殊颜色 + 名称后缀，且即使同队也画
         local tag, specialColor = GetPlayerTag(player)
 
         local tooFar = false
