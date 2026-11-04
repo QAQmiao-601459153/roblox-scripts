@@ -30,6 +30,18 @@
 -- 新增 21: 「主要」页新增反挂机 —— 固定每 19 分钟模拟一次鼠标左键点击（VirtualInputManager /
 --          mouse1click / VirtualUser 三套兜底），刷新闲置计时，防止 20 分钟没输入被服务器踢；
 --          另外监听 Idled 事件再补一次点击兜底
+-- 新增 22: 「车辆」页新增车辆传送 —— 传送到准星位置 / 传送到输入框坐标 / 记录当前位置。
+--          实测（独立测试脚本）客户端对车体有网络所有权，直接摆位置服务器接受、不回弹，
+--          所以默认走一帧瞬移，滑行模式留作备用；坐标统一按「车体锚点 (model pivot)」算，
+--          记录完再传回去能精确回到原地（早期版本记的是底盘零件，会整体偏一截）
+-- 修复 23: 车辆传送的锚点改回「你坐着的那个 VehicleSeat 的位置」——之前用 model:GetPivot()，
+--          遇到模型层级套得深 / pivot 定在不动件上的车，车都开出去一段了锚点还在原地，
+--          于是记录出来的坐标不对、传送一直提示"已经在这个位置了"。座位位置 100% 跟着车走；
+--          同时传送改成「只算平移量」（delta），不再依赖 pivot 的绝对值
+-- 新增 24: 「仅持枪时自瞄」—— 手上 Tool 不是枪就不锁（玩家自瞄 + NPC 自瞄都管），
+--          判定顺序：内置 69 把枪名表 / 名字里的枪械词 → TConfigToUse 属性对应的
+--          GunConfigs.Guns 模块 → 工具里带弹药容器；三条都不中の不是枪。
+--          按住右键时右下角会提示「手上不是枪」，FOV 圈在手非枪时变灰，换枪时控制台会说明。
 -- ============================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -43,7 +55,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-03 r49 · 反挂机固定每 19 分钟模拟点击（无间隔滑块）"
+local SCRIPT_VERSION = "2026-11-04 r52 · 新增「仅持枪时自瞄」（手上不是枪不锁）"
 
 -- ============================ 内置管理员名单 ============================
 -- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
@@ -90,6 +102,8 @@ local State = {
     AdminTeamKeywords = "联邦,government,federal,admin,moderator,staff",
     HVTeamKeywords = "plantdirector,总监",
     AimbotEnabled = false, AimbotFOV = 120, ShowFOV = true, TargetPart = "Head", AimbotPredict = true, AimbotSpeed = 1000,
+    -- 仅持枪时自瞄：手上 Tool 不是枪就不锁（"是不是枪"的判定见 GunSpeed.IsGunTool）
+    OnlyGunAim = true,
     -- 弹速自动读取（TREK GunConfig）+ 下坠补偿：读不到配置时自动退回上面的手填值
     -- AimSpeedLiveRead 默认关：实测 require 游戏配置会让枪拿不上，平时只用内置表
     AimSpeedAuto = true, AimDropComp = true, AimSpeedLiveRead = false,
@@ -105,6 +119,8 @@ local State = {
     VehicleTurnEnabled = false, VehicleTurnRate = 180, VehiclePushSmooth = 12,
     -- 车辆低空悬浮（只贴地托起，不做自由升降；服务器会检测高度，飞高扣车血）
     VehicleHoverEnabled = false, VehicleHoverHeight = 8, VehicleHoverGain = 8,
+    -- 车辆传送：坐标一律按「车体锚点 (model pivot)」，记录 / 传送 / 回填共用同一个点
+    VehicleTPCooldown = 3, VehicleTPGlide = false, VehicleTPGlideStep = 25,
     UserList = MOD_USERNAMES,
     AutoCheck = false, CheckInterval = 5, AutoExit = false, DisableOnAdmin = false,
     -- 检测到管理员时自动重置角色（本地重置：断关节 + 血量归零 + Dead 状态）
@@ -846,6 +862,183 @@ local function ApplyVehicleHover(dt)
     end)
 end
 
+-- ============================ 车辆传送 ============================
+-- 实测结论（见独立测试脚本 naramo_vehicle_tp_test.lua）：客户端对车体有网络所有权，
+-- 直接把车摆到新位置，服务器会接受、不回弹，所以默认走「一帧瞬移」；滑行模式留作备用。
+-- 重要约定：所有坐标 —— 记录、输入、传送、回填 —— 一律指「车座锚点」：
+--   也就是玩家坐着的那个 VehicleSeat 的位置。它 100% 跟着车走。
+-- 早期版本用 model:GetPivot() 当锚点，遇到 pivot 定义怪 / 模型层级套得深的车，
+-- 车开出去后锚点还在原地，于是记录出来的位置是错的、传送又一直报"已经在这个位置了"。
+local TPLastAt = 0
+local TPRay = RaycastParams.new()
+pcall(function() TPRay.FilterType = Enum.RaycastFilterType.Blacklist end)
+
+-- 射线别打到自己的车和角色
+local function TPFilter(base, model)
+    local ignore = { base }
+    if model then table.insert(ignore, model) end
+    if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+    TPRay.FilterDescendantsInstances = ignore
+end
+
+local function TPAnchor(seat)
+    local ok, pos = pcall(function() return seat.CFrame.Position end)
+    if ok and pos then return pos end
+    return nil
+end
+
+-- 给 UI 用：读当前车体锚点（没在车上返回 nil）
+-- 用全局名而不是顶层 local：文件头的"修复 11"说过顶层局部变量有 200 个硬上限，
+-- 这里一个新名额都不占（同 NARAMO_VEHICLE_FORWARD / NARAMO_GUNSPEED 的做法）
+NARAMO_VehicleAnchor = function()
+    local seat = GetCurrentVehicleSeat()
+    if not seat then return nil end
+    return TPAnchor(seat)
+end
+
+-- 从某点上方 300 studs 往下探地面；探不到返回 nil。
+-- 注意：如果在室内/桥下，上方射线会先打中天花板，这种情况改从目标点本身往下重打一次，
+-- 否则「离地高度」会算成 1 stud，车会被放到贴着地面、轮子插进地里。
+local function TPGroundY(pos, base, model)
+    TPFilter(base, model)
+    local ok, hit = pcall(function()
+        return workspace:Raycast(pos + Vector3.new(0, 300, 0), Vector3.new(0, -3000, 0), TPRay)
+    end)
+    if ok and hit and hit.Position.Y <= pos.Y + 1 then return hit.Position.Y end
+    local ok2, hit2 = pcall(function()
+        return workspace:Raycast(pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -3000, 0), TPRay)
+    end)
+    if ok2 and hit2 then return hit2.Position.Y end
+    return nil
+end
+
+-- 取「这一辆车的模型」：模型层级乱的时候 GetVehicleBasePart 可能一路爬到
+-- "所有车"的容器模型上，那种大模型一旦 PivotTo 会把全场的车一起挪走。
+-- 用包围盒尺寸做保险：超过 200 studs 就不当成单车，退回挪刚体根。
+local function TPCarModel(model, seat)
+    if not model or model == seat then return nil end
+    local ok, _, size = pcall(function() return model:GetBoundingBox() end)
+    if not ok or not size then return nil end
+    if math.max(size.X, size.Y, size.Z) > 200 then return nil end
+    return model
+end
+
+-- 只平移车体、不改朝向：给一个位移量，整辆车挪过去。
+-- 注意这里刻意只算「挪多少」而不去读绝对位置 —— 即使某些车的 pivot 定义得很怪，
+-- 平移量也不会错位（PivotTo 内部会按模型自己的 pivot 换算，这里只提供增量）。
+local function TPShift(base, model, delta, seat)
+    if model then
+        local pv = model:GetPivot()
+        model:PivotTo(CFrame.new(pv.Position + delta) * (pv - pv.Position))
+    else
+        -- 拿不到"这一辆车"的模型（层级太乱 / 挂在所有车的容器下）时，
+        -- 挪座位所在的刚体根：刚体根一动整辆组装体跟着走，比挪单个零件稳
+        local root = nil
+        if seat then
+            local ok, r = pcall(function() return seat.AssemblyRootPart end)
+            if ok then root = r end
+        end
+        root = root or base
+        local cf = root.CFrame
+        root.CFrame = CFrame.new(cf.Position + delta) * (cf - cf.Position)
+    end
+end
+
+-- 准星目标：屏幕中心打一条 3000 studs 的射线
+local function TPCursorTarget(base, model)
+    local cam = workspace.CurrentCamera
+    if not cam then return nil, "拿不到相机" end
+    local vp = cam.ViewportSize
+    local ok, ray = pcall(function() return cam:ViewportPointToRay(vp.X * 0.5, vp.Y * 0.5) end)
+    if not ok or not ray then return nil, "取不到屏幕中心射线" end
+    TPFilter(base, model)
+    local ok2, hit = pcall(function()
+        return workspace:Raycast(ray.Origin, ray.Direction * 3000, TPRay)
+    end)
+    if not ok2 or not hit then return nil, "准星没打到东西（3000 studs 内）" end
+    return hit.Position
+end
+
+-- 返回 ok, 说明文字。target 为 nil 或 opts.cursor 时走准星；
+-- opts.exactY 为真时 Y 以调用方给的为准（记录点才能精确回传）
+NARAMO_VehicleTeleport = function(target, opts)
+    opts = opts or {}
+    if IsClosing then return false, "脚本已关闭" end
+    local seat = GetCurrentVehicleSeat()
+    if not seat then return false, "没在车上（坐进 VehicleSeat 再传）" end
+    local base, model = GetVehicleBasePart(seat)
+    if not base or not base:IsA("BasePart") then return false, "找不到车体主部件" end
+    local carModel = TPCarModel(model, seat)
+
+    local now = os.clock()
+    local cd = tonumber(State.VehicleTPCooldown) or 3
+    if TPLastAt > 0 and (now - TPLastAt) < cd then
+        return false, string.format("冷却中，还要 %.1f 秒", cd - (now - TPLastAt))
+    end
+
+    if opts.cursor or not target then
+        local t, err = TPCursorTarget(base, carModel)
+        if not t then return false, err end
+        target, opts.exactY = t, nil
+    end
+
+    local from = TPAnchor(seat)
+    if not from then return false, "读不到车座位置（车可能刚被拆）" end
+    local gHere = TPGroundY(from, base, carModel)
+    local rise = 4
+    if gHere then rise = math.clamp(from.Y - gHere, 1, 20) end
+    local gThere = TPGroundY(target, base, carModel)
+
+    local goalY
+    if opts.exactY then
+        -- 输入 / 记录的坐标：Y 以你给的为准，只在明显埋进地面时抬回来
+        goalY = target.Y
+        if gThere and goalY < gThere + 1 then goalY = gThere + rise end
+    else
+        -- 准星点：贴地，保留原车离地高度
+        goalY = (gThere or target.Y) + rise
+    end
+    local goal = Vector3.new(target.X, goalY, target.Z)
+
+    -- 只算「要平移多少」，不做绝对定位：这样哪怕某辆车的 pivot 定义很怪也不会错位
+    local delta = goal - from
+    local dist = delta.Magnitude
+    print(string.format(
+        "[NARAMO] 车辆传送: 起点 (%.0f, %.0f, %.0f) → 目标 (%.0f, %.0f, %.0f)，距离 %.0f，车型 %s",
+        from.X, from.Y, from.Z, goal.X, goal.Y, goal.Z, dist, tostring(carModel and carModel.Name or "?")))
+
+    if dist > 6000 then
+        return false, string.format("目标太远 %.0f studs，已拒绝", dist)
+    end
+    if dist < 0.5 then
+        return false, string.format("已经在这个位置了（车在 %.0f, %.0f, %.0f）", from.X, from.Y, from.Z)
+    end
+
+    TPLastAt = now
+    local ok, err = pcall(function()
+        if State.VehicleTPGlide then
+            local step = math.max(5, tonumber(State.VehicleTPGlideStep) or 25)
+            local steps = math.max(1, math.ceil(dist / step))
+            for i = 1, steps do
+                if IsClosing then return end
+                TPShift(base, carModel, delta * (i / steps), seat)
+                RunService.Heartbeat:Wait()
+            end
+        else
+            TPShift(base, carModel, delta, seat)
+        end
+    end)
+
+    -- 清惯性：不清的话传完会带着旧速度继续漂
+    pcall(function()
+        base.AssemblyLinearVelocity = Vector3.zero
+        base.AssemblyAngularVelocity = Vector3.zero
+    end)
+
+    if not ok then return false, "移动失败: " .. tostring(err) end
+    return true, string.format("车辆已传送 %.0f studs（→ %.0f, %.0f, %.0f）", dist, goal.X, goal.Y, goal.Z)
+end
+
 Track(RunService.Heartbeat:Connect(function(dt)
     if IsClosing then return end
     if State.VehicleHoverEnabled then ApplyVehicleHover(dt) end
@@ -1125,12 +1318,119 @@ function GunSpeed.Muzzle()
     return workspace.CurrentCamera.CFrame.Position
 end
 
--- 换枪 / 重生都重读一次
+-- ============ 持枪判定（「仅持枪时自瞄」用） ============
+-- 只读判断，不改任何游戏数据。判定顺序（命中一条就算枪）：
+--   1) 名字在内置枪表 GunSpeed.DB（69 把枪）里，或名字里带枪械词
+--      —— 不依赖游戏结构，最稳，先走这条
+--   2) Tool 上的 TConfigToUse 属性，而且 GunConfigs.Guns 里真有同名模块
+--      —— 游戏给枪挂的配置名，新枪 / 改过名的枪也能认
+--   3) 工具里带弹药（TAmmo / LocalTAmmo 这类容器，或名字带 ammo 的数值对象）
+--      —— 最后的兜底，防止认不出枪名时把自瞄全挡掉
+-- 判定结果按 Tool 实例缓存：认定是枪就一直有效；认定不是的每秒重判一次
+-- （TConfigToUse 属性有时比 Tool 本身晚到，不能只判一次就定死）。
+GunSpeed.GUN_WORDS = { "gun", "rifle", "smg", "lmg", "pistol", "revolver", "carbine",
+    "sniper", "shotgun", "launcher", "bazooka", "lasgun", "bolter", "firearm", "cannon" }
+GunSpeed.verdict = setmetatable({}, { __mode = "k" })   -- 弱键：旧工具不会一直留在内存里
+
+function GunSpeed.IsGunName(name)
+    if type(name) ~= "string" or name == "" then return false end
+    if GunSpeed.LookupDB(name) then return true end
+    local lk = string.lower(name)
+    for _, w in ipairs(GunSpeed.GUN_WORDS) do
+        if string.find(lk, w, 1, true) then return true end
+    end
+    return false
+end
+
+-- 手上正拿着的工具（角色下装备中的 Tool 只会有一个）
+function GunSpeed.CurrentTool()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool and tool:IsA("Tool") then return tool end
+    return nil
+end
+
+-- 工具里有没有弹药痕迹（TAmmo / LocalTAmmo 这类容器，或 AmmoXXX 数值对象）
+function GunSpeed.HasAmmoEvidence(tool)
+    local found = false
+    pcall(function()
+        for _, d in ipairs(tool:GetDescendants()) do
+            local ln = string.lower(tostring(d.Name))
+            if string.find(ln, "ammo", 1, true)
+                and (d:IsA("Folder") or d:IsA("ValueBase") or d:IsA("Configuration")) then
+                found = true
+                return
+            end
+        end
+    end)
+    return found
+end
+
+-- 返回：是不是枪, 判定理由, 工具名（不是枪时理由会写清卡在哪一条，方便排查）
+function GunSpeed.IsGunTool(tool)
+    if not tool or not tool:IsA("Tool") then return false, "空手", nil end
+    local name = tostring(tool.Name)
+    local c = GunSpeed.verdict[tool]
+    if c and (c.gun or (os.clock() - c.at) < 1) then return c.gun, c.why, name end
+
+    local why = nil
+    local note = nil
+    if GunSpeed.IsGunName(name) then
+        why = "名字命中内置枪表 / 带枪械词"
+    else
+        local attr = nil
+        pcall(function() attr = tool:GetAttribute("TConfigToUse") end)
+        if type(attr) == "string" and attr ~= "" then
+            local guns = GunSpeed.Folder()
+            local hit = nil
+            if guns then
+                local ok, child = pcall(function() return guns:FindFirstChild(attr) end)
+                if ok then hit = child end
+            end
+            if hit then
+                why = "TConfigToUse=" .. attr .. "（GunConfigs.Guns 里有同名模块）"
+            elseif GunSpeed.HasAmmoEvidence(tool) then
+                why = "TConfigToUse=" .. attr .. " + 工具里带弹药"
+            else
+                note = "（TConfigToUse=" .. attr .. "，但 Guns 里没这个模块、工具里也没弹药）"
+            end
+        elseif GunSpeed.HasAmmoEvidence(tool) then
+            why = "工具里带弹药"
+        end
+    end
+
+    local isGun = why ~= nil
+    local reason = why or ("名字不认识、也没有枪械特征" .. (note or ""))
+    GunSpeed.verdict[tool] = {
+        gun = isGun,
+        why = reason,
+        at = os.clock(),
+    }
+    return isGun, reason, name
+end
+
+-- 自瞄统一入口：OnlyGunAim 关着就直接放行（返回 true = 可以自瞄）
+function GunSpeed.AimAllowed()
+    if not State.OnlyGunAim then return true, nil, nil end
+    return GunSpeed.IsGunTool(GunSpeed.CurrentTool())
+end
+
+-- 换枪 / 重生都重读一次；顺便把「这把算不算枪、自瞄会不会生效」打到控制台
 local function watchTool(container)
     if not container then return end
     Track(container.ChildAdded:Connect(function(child)
         if child:IsA("Tool") then
-            task.delay(0.35, function() GunSpeed.Refresh(child.Name) end)
+            task.delay(0.35, function()
+                GunSpeed.Refresh(child.Name)
+                if State.OnlyGunAim and not IsClosing then
+                    local isGun, why, name = GunSpeed.IsGunTool(child)
+                    print(string.format("[NARAMO] 仅持枪时自瞄: 换上 %s → %s（%s）",
+                        tostring(name or child.Name),
+                        isGun and "是枪，自瞄可用" or "不是枪，自瞄暂停",
+                        tostring(why)))
+                end
+            end)
         end
     end))
 end
@@ -2641,6 +2941,28 @@ CreateToggle(AimbotPage, "开启自瞄 (按住右键 / 移动端悬浮按钮)", 
         MobileAimBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
     end
 end)
+-- 仅持枪时自瞄：手上 Tool 不是枪就不锁（玩家自瞄 + NPC 自瞄都管；判定见 GunSpeed.IsGunTool）
+CreateToggle(AimbotPage, "仅持枪时自瞄 (手上不是枪就不锁)", "OnlyGunAim", State.OnlyGunAim, function(v)
+    State.OnlyGunAim = v
+    if not State.OnlyGunAim then return end        -- 关掉时不用判定，直接放行
+    local isGun, why, name = GunSpeed.IsGunTool(GunSpeed.CurrentTool())
+    print(string.format("[NARAMO] 仅持枪时自瞄: 开 | 当前手上 %s → %s（%s）",
+        tostring(name or "空手"), isGun and "是枪" or "不是枪", tostring(why)))
+end)
+-- 手动检测一次：换枪后不确定手上算不算枪就点它，控制台 + 右上角通知都会说清楚
+CreateButton(AimbotPage, "检测当前手持武器 (算不算枪 / 自瞄会不会生效)", function()
+    local isGun, why, name = GunSpeed.IsGunTool(GunSpeed.CurrentTool())
+    local msg = string.format("手上 %s → %s（%s）", tostring(name or "空手"),
+        isGun and "是枪" or "不是枪", tostring(why))
+    print("[NARAMO] 持枪检测: " .. msg)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "NARAMO 持枪检测",
+            Text = msg,
+            Duration = 4,
+        })
+    end)
+end)
 CreateToggle(AimbotPage, "显示 FOV 圈", "ShowFOV", State.ShowFOV, function(v) State.ShowFOV = v end)
 CreateSlider(AimbotPage, "FOV 范围", "AimbotFOV", 20, 500, State.AimbotFOV, function(v) State.AimbotFOV = v end)
 CreateSlider(AimbotPage, "最远自瞄距离 (studs)", "AimMaxDist", 50, 5000, State.AimMaxDist, function(v) State.AimMaxDist = v end)
@@ -2716,6 +3038,72 @@ CreateSlider(VehiclePage, "悬浮高度 (越高越容易被检测)", "VehicleHov
     State.VehicleHoverHeight = v
 end)
 CreateSlider(VehiclePage, "悬浮跟随速度 (越大贴地越紧)", "VehicleHoverGain", 2, 20, State.VehicleHoverGain, function(v) State.VehicleHoverGain = v end)
+
+-- 车辆传送（实测服务器接受客户端摆位置，不回弹；默认一帧瞬移）
+-- 包成 do ... end：这几个局部变量用完即释放，不占顶层 200 个名额
+do
+    local tpBox = CreateInput(VehiclePage, "目标坐标：x, y, z（逗号或空格分隔，可直接粘贴）", nil)
+
+    -- "123, 45, 678" / "123 45 678" / "123,45,678" 都认
+    local function ParseVec3(text)
+        local n = {}
+        for s in tostring(text or ""):gmatch("-?%d+%.?%d*") do
+            n[#n + 1] = tonumber(s)
+            if #n >= 3 then break end
+        end
+        if #n < 3 then return nil end
+        return Vector3.new(n[1], n[2], n[3])
+    end
+
+    -- 传送结果弹个通知，省得每次去翻控制台
+    local function TPNotify(text)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = "车辆传送", Text = tostring(text), Duration = 3,
+            })
+        end)
+    end
+
+    CreateButton(VehiclePage, "传送到准星位置", function()
+        if IsClosing then return end
+        local ok, msg = NARAMO_VehicleTeleport(nil, { cursor = true })
+        print("[NARAMO] 车辆传送: " .. tostring(msg))
+        TPNotify(msg)
+    end)
+
+    CreateButton(VehiclePage, "传送到输入框坐标", function()
+        if IsClosing then return end
+        local v = ParseVec3(tpBox.Text)
+        if not v then
+            print("[NARAMO] 车辆传送: 坐标格式不对，需要三个数字，例如 123, 45, 678")
+            return
+        end
+        local ok, msg = NARAMO_VehicleTeleport(v, { exactY = true })
+        print("[NARAMO] 车辆传送: " .. tostring(msg))
+        TPNotify(msg)
+    end)
+
+    CreateButton(VehiclePage, "记录当前车位置 → 填进输入框", function()
+        if IsClosing then return end
+        local p = NARAMO_VehicleAnchor()
+        if not p then
+            print("[NARAMO] 车辆传送: 没在车上，没东西可记")
+            return
+        end
+        tpBox.Text = string.format("%.0f, %.0f, %.0f", p.X, p.Y, p.Z)
+        print(string.format("[NARAMO] 已记录车位置 (%.0f, %.0f, %.0f)", p.X, p.Y, p.Z))
+    end)
+
+    CreateSlider(VehiclePage, "传送冷却 (秒)", "VehicleTPCooldown", 0, 30, State.VehicleTPCooldown, function(v)
+        State.VehicleTPCooldown = v
+    end)
+    CreateToggle(VehiclePage, "滑行传送 (瞬移被卡时备用)", "VehicleTPGlide", State.VehicleTPGlide, function(v)
+        State.VehicleTPGlide = v
+    end)
+    CreateSlider(VehiclePage, "滑行每帧位移 (studs)", "VehicleTPGlideStep", 5, 100, State.VehicleTPGlideStep, function(v)
+        State.VehicleTPGlideStep = v
+    end)
+end
 
 -- 队伍页面（管理 / 植物总监）
 local TeamPage = CreatePage("队伍")
@@ -3880,27 +4268,46 @@ end
 
 Track(RunService.RenderStepped:Connect(function()
     if IsClosing then return end
+
+    -- 仅持枪时自瞄：手上 Tool 不是枪 → gunOk = false，玩家自瞄和 NPC 自瞄一起停
+    -- （OnlyGunAim 关掉时 AimAllowed 恒返回 true，行为和以前完全一样）
+    local gunOk, gunWhy, gunName = GunSpeed.AimAllowed()
+
     if FOVCircle then
         FOVCircle.Position = workspace.CurrentCamera.ViewportSize / 2
         FOVCircle.Radius = State.AimbotFOV
         FOVCircle.Visible = State.ShowFOV
         FOVCircle.Thickness = 1.5
-        FOVCircle.Color = Color3.fromRGB(0, 255, 150)
+        -- 手上有枪 = 绿色；手非枪被暂停 = 灰色，一眼看得出自瞄现在不生效
+        FOVCircle.Color = gunOk and Color3.fromRGB(0, 255, 150) or Color3.fromRGB(130, 130, 140)
     end
     -- 移动端悬浮按钮：只在对应自瞄开启时出现
     if MobileAimBtn then MobileAimBtn.Visible = State.AimbotEnabled end
     if MobileNpcAimBtn then MobileNpcAimBtn.Visible = State.NPCAimEnabled end
 
     local rmb = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-    local playerActive = State.AimbotEnabled and (rmb or State.AimMobileActive)
-    local npcActive = State.NPCAimEnabled and (rmb or State.NpcAimMobileActive)
+    local playerActive = State.AimbotEnabled and (rmb or State.AimMobileActive) and gunOk
+    local npcActive = State.NPCAimEnabled and (rmb or State.NpcAimMobileActive) and gunOk
 
-    -- 松开右键 / 关掉开关：立刻解除锁定，下次按下重新选人
+    -- 松开右键 / 关掉开关 / 手上不是枪：立刻解除锁定，下次按下重新选人
     if not (playerActive or npcActive) then
         AimLockPart = nil
         AimLockIsNPC = false
         AimLockHeld = false
-        if LockText then LockText.Visible = false end
+        if LockText then
+            -- 本来想自瞄、但被「仅持枪」挡住时给一句提示，让人知道是暂停而不是脚本坏了
+            local wantAim = (State.AimbotEnabled and (rmb or State.AimMobileActive))
+                or (State.NPCAimEnabled and (rmb or State.NpcAimMobileActive))
+            if wantAim and not gunOk then
+                local vp = workspace.CurrentCamera.ViewportSize
+                LockText.Text = "仅持枪时自瞄：手上不是枪"
+                    .. (gunName and ("（" .. gunName .. "）") or "（空手）")
+                LockText.Position = Vector2.new(vp.X / 2 + 26, vp.Y / 2 + 20)
+                LockText.Visible = true
+            else
+                LockText.Visible = false
+            end
+        end
         return
     end
 
