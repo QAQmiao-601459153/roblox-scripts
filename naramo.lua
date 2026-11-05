@@ -40,8 +40,15 @@
 --          同时传送改成「只算平移量」（delta），不再依赖 pivot 的绝对值
 -- 新增 24: 「仅持枪时自瞄」—— 手上 Tool 不是枪就不锁（玩家自瞄 + NPC 自瞄都管），
 --          判定顺序：内置 69 把枪名表 / 名字里的枪械词 → TConfigToUse 属性对应的
---          GunConfigs.Guns 模块 → 工具里带弹药容器；三条都不中の不是枪。
+--          GunConfigs.Guns 模块 → 工具里带弹药容器；三条都不命中的，就不是枪。
 --          按住右键时右下角会提示「手上不是枪」，FOV 圈在手非枪时变灰，换枪时控制台会说明。
+-- 新增 25: 「静默自瞄」—— 不转相机，只在开火那一瞬间把方向改成目标点（原理同 xk 的无声自瞄）。
+--          但 xk 那套 __namecall 钩子 Xeno 没有，这游戏的枪也不走 RemoteEvent:FireServer，
+--          所以改成替换 GunRemotes.Projectile.FireServerNew 表字段；默认关，
+--          面板上带「静默自瞄自检」，能看拦截/改写次数、开火参数形状和执行器 API。
+-- 新增 26: 「持枪自动开火」—— 检测到手上有枪就模拟按住鼠标左键（全自动枪一直打），
+--          收枪 / 换非枪工具 / 死亡 / 聊天框聚焦 / 关脚本都会自动松开；
+--          半自动枪按住只响一发，面板上可切「改用连点」并按毫秒设间隔。
 -- ============================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -55,7 +62,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-04 r52 · 新增「仅持枪时自瞄」（手上不是枪不锁）"
+local SCRIPT_VERSION = "2026-11-04 r54 · 新增持枪自动开火（持枪即模拟按住左键）"
 
 -- ============================ 内置管理员名单 ============================
 -- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
@@ -104,6 +111,12 @@ local State = {
     AimbotEnabled = false, AimbotFOV = 120, ShowFOV = true, TargetPart = "Head", AimbotPredict = true, AimbotSpeed = 1000,
     -- 仅持枪时自瞄：手上 Tool 不是枪就不锁（"是不是枪"的判定见 GunSpeed.IsGunTool）
     OnlyGunAim = true,
+    -- 静默自瞄：不改相机，只在开火那一刻把方向参数改成目标点（见下面的 Silent 模块）
+    -- SilentDryRun = 干跑：只记录开火参数、不改写，第一次试新枪时用
+    SilentAim = false, SilentRange = 300, SilentTeamCheck = true, SilentDryRun = false,
+    -- 持枪自动开火：检测到手上有枪就模拟按住左键
+    -- AutoFireClick = 半自动枪改用连点；AutoFireIntervalMs = 连点间隔（毫秒）
+    AutoFire = false, AutoFireClick = false, AutoFireIntervalMs = 80,
     -- 弹速自动读取（TREK GunConfig）+ 下坠补偿：读不到配置时自动退回上面的手填值
     -- AimSpeedLiveRead 默认关：实测 require 游戏配置会让枪拿不上，平时只用内置表
     AimSpeedAuto = true, AimDropComp = true, AimSpeedLiveRead = false,
@@ -1436,6 +1449,12 @@ local function watchTool(container)
 end
 
 watchTool(LocalPlayer.Character)
+-- 脚本加载时如果枪已经在手上（不是刚换的），先读一次弹速；
+-- 不然静默自瞄的预判会退回滑块默认值（1000），远距离提前量会差很多
+pcall(function()
+    local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+    if tool then GunSpeed.Refresh(tool.Name) end
+end)
 Track(LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(1)
     if IsClosing or not char then return end
@@ -1448,11 +1467,502 @@ end))
 pcall(function() getgenv().NARAMO_GUNSPEED = GunSpeed end)
 end   -- 弹速段结束
 
+-- ============================ 静默自瞄（改写开火参数，不动视角） ============================
+-- 原型：xk新版通用.lua 的「无声自瞄」。它的做法是钩 __namecall，把开火远端里的
+-- Vector3 / CFrame 参数换成目标坐标，相机完全不转，所以屏幕上看起来没瞄准。
+--
+-- 但直接搬过来在这台执行器 / 这个游戏上跑不起来：
+--   1) xk 依赖 getrawmetatable(game) + newcclosure + getnamecallmethod，
+--      Xeno 这三样都没有（之前的探针 dump 已确认），钩子根本挂不上；
+--   2) 这游戏的枪不发 RemoteEvent:FireServer，而是走
+--      ReplicatedStorage.GunRemotes.Projectile.FireServerNew(self, origin, dir, velocity, behavior, mode)，
+--      再由它打包成 GunPackets 发出去，所以就算钩到 __namecall 也看不到开火。
+--
+-- 所以这里保留「改写开火参数」这个原理，换成这个游戏真正走得通的做法：
+--   替换 GunRemotes.Projectile.FireServerNew 这个表字段，在游戏发包前把方向 / 坐标
+--   参数改成目标点（枪脚本是查表调用，表字段替换能生效）。如果枪脚本把函数缓存进了
+--   局部变量，就会一次都拦截不到 —— 「静默自瞄自检」按钮会直接显示拦截次数。
+-- 安全兜底：改写后的参数如果让游戏报错，就退回原始参数再打一次，保证还能正常开枪。
+local Silent = {
+    installed = false, proj = nil, orig = nil, wrap = nil,
+    shots = 0, rewrites = 0, would = 0, skipped = 0, failed = 0,
+    logged = 0, tries = 0, targetName = nil, targetDist = nil,
+    predict = nil,          -- 延迟赋值：GetPredictPosition（文件后面才定义）
+}
+
+do
+local Unpack = table.unpack or unpack
+
+local function SilentMyPos()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root then return root.Position end
+    local cam = workspace.CurrentCamera
+    if cam then return cam.CFrame.Position end
+    return Vector3.new(0, 0, 0)
+end
+
+-- 选目标：按世界距离挑最近的，和准心 / FOV 无关（静默自瞄不看屏幕位置）
+local function SilentPickTarget()
+    local myPos = SilentMyPos()
+    local range = tonumber(State.SilentRange) or 300
+    local best, bestPart, bestDist = nil, nil, range
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            local part = p.Character:FindFirstChild(State.TargetPart)
+                or p.Character:FindFirstChild("HumanoidRootPart")
+            if part and hum and hum.Health > 0 then
+                local sameTeam = State.SilentTeamCheck
+                    and LocalPlayer.Team ~= nil and p.Team ~= nil
+                    and LocalPlayer.Team == p.Team
+                if not sameTeam then
+                    local d = (part.Position - myPos).Magnitude
+                    if d < bestDist then best, bestPart, bestDist = p, part, d end
+                end
+            end
+        end
+    end
+    return bestPart, bestDist, (best and best.Name) or nil
+end
+
+-- 开火参数摘要：前几次开火打到控制台，实际形状和 xk 那边不一样时一眼能看出来
+local function SilentDescribeArgs(args, n)
+    local out = {}
+    for i = 1, math.min(n, 8) do
+        local v = args[i]
+        local tv = typeof(v)
+        if tv == "Vector3" then
+            out[i] = string.format("V3(%.1f,%.1f,%.1f)|%.2f", v.X, v.Y, v.Z, v.Magnitude)
+        elseif tv == "CFrame" then
+            out[i] = "CFrame"
+        elseif tv == "Instance" then
+            out[i] = "Inst(" .. tostring(v.Name) .. ")"
+        elseif tv == "table" then
+            out[i] = "table"
+        else
+            out[i] = tostring(v)
+        end
+    end
+    return table.concat(out, ", ")
+end
+
+-- 参数改写：原点（FireServerNew 的第 2 个参数，枪口 / 相机位置）不动，
+-- 单位向量当方向改写，远处的世界坐标当瞄点改写，CFrame 改成「看向目标」。
+local function SilentRewrite(args, n, aimPos)
+    local myPos = SilentMyPos()
+    -- 签名是 FireServerNew(self, origin, dir, velocity, behavior, mode)：
+    -- 第 2 个参数就是原点；万一不是 Vector3（换了路径），再按「离自己最近」兜底。
+    local origin = nil
+    if typeof(args[2]) == "Vector3" then
+        origin = args[2]
+    else
+        for i = 2, n do
+            local v = args[i]
+            if typeof(v) == "Vector3" and (v - myPos).Magnitude < 20 then
+                origin = v
+                break
+            end
+        end
+    end
+    origin = origin or myPos
+
+    local changed = 0
+    for i = 2, n do
+        local v = args[i]
+        local tv = typeof(v)
+        if tv == "Vector3" then
+            if v ~= origin then
+                if v.Magnitude <= 4 then
+                    -- 单位向量 = 方向
+                    local dir = aimPos - origin
+                    if dir.Magnitude > 0.05 then
+                        args[i] = dir.Unit
+                        changed = changed + 1
+                    end
+                elseif (v - myPos).Magnitude > 12 then
+                    -- 世界坐标 = 瞄点之类
+                    args[i] = aimPos
+                    changed = changed + 1
+                end
+            end
+        elseif tv == "CFrame" then
+            args[i] = CFrame.new(v.Position, aimPos)
+            changed = changed + 1
+        end
+    end
+    return changed
+end
+
+local function SilentMakeWrapper(orig)
+    return function(...)
+        if IsClosing or not State.SilentAim then return orig(...) end
+
+        Silent.shots = Silent.shots + 1
+        local n = select("#", ...)
+        local args = { ... }
+
+        local part, dist, tname = SilentPickTarget()
+        local would, changed = 0, 0
+        if part then
+            local aim = part.Position
+            local pred = Silent.predict
+            if pred then
+                local okp, pos = pcall(pred, part)
+                if okp and typeof(pos) == "Vector3" then aim = pos end
+            end
+            local okr, c = pcall(SilentRewrite, args, n, aim)
+            if okr then would = tonumber(c) or 0 end
+            changed = would
+            Silent.targetName, Silent.targetDist = tname, dist
+        else
+            Silent.targetName, Silent.targetDist = nil, nil
+        end
+
+        if would > 0 then Silent.would = Silent.would + 1 end
+        if Silent.logged < 3 then
+            Silent.logged = Silent.logged + 1
+            print(string.format("[NARAMO][静默] 开火参数 #%d: %s | 目标: %s | 改写: %d",
+                Silent.logged, SilentDescribeArgs(args, n), tostring(tname or "无"), would))
+        end
+
+        if changed <= 0 or State.SilentDryRun then
+            Silent.skipped = Silent.skipped + 1
+            return orig(...)
+        end
+
+        local okCall, r1, r2 = pcall(orig, Unpack(args, 1, n))
+        if not okCall then
+            Silent.failed = Silent.failed + 1
+            return orig(...)          -- 改完的参数被游戏拒了：退回原参数，保证还能开枪
+        end
+        Silent.rewrites = Silent.rewrites + 1
+        return r1, r2
+    end
+end
+
+-- 安装 / 卸载：替换的是模块表里的字段，不需要 hookfunction（Xeno 也没有）
+function Silent.Install()
+    if Silent.installed and Silent.proj then return true, "已安装" end
+    local rs = game:GetService("ReplicatedStorage")
+    local gr = rs:FindFirstChild("GunRemotes")
+    if not gr then return false, "ReplicatedStorage 里没有 GunRemotes（还没进对局？）" end
+    local ok, gm = pcall(require, gr)
+    if not ok or type(gm) ~= "table" then return false, "require GunRemotes 失败: " .. tostring(gm) end
+    local proj = gm.Projectile
+    if type(proj) ~= "table" then return false, "GunRemotes.Projectile 不存在或不是表" end
+    local fn = proj.FireServerNew
+    if type(fn) ~= "function" then return false, "Projectile.FireServerNew 不存在（开火路径可能改了）" end
+
+    local wrap = SilentMakeWrapper(fn)
+    pcall(function() proj.FireServerNew = wrap end)
+    local now = nil
+    pcall(function() now = proj.FireServerNew end)
+    if now ~= wrap then
+        pcall(rawset, proj, "FireServerNew", wrap)      -- 表有 __newindex 拦截时再走 rawset
+        pcall(function() now = proj.FireServerNew end)
+    end
+    if now ~= wrap then return false, "FireServerNew 写不进去（Projectile 表被冻结 / 有元表拦截）" end
+
+    Silent.installed, Silent.proj, Silent.orig, Silent.wrap = true, proj, fn, wrap
+    return true, "已替换 FireServerNew"
+end
+
+function Silent.Uninstall()
+    if not Silent.installed then return end
+    pcall(function()
+        if Silent.proj and Silent.proj.FireServerNew == Silent.wrap then
+            Silent.proj.FireServerNew = Silent.orig
+        end
+    end)
+    Silent.installed, Silent.proj, Silent.orig, Silent.wrap = false, nil, nil, nil
+end
+
+-- 刚进图 GunRemotes 还没复制好时安装会失败，隔 2 秒重试几次
+function Silent.Retry()
+    if IsClosing or not State.SilentAim or Silent.installed then return end
+    Silent.tries = (Silent.tries or 0) + 1
+    if Silent.tries > 5 then
+        print("[NARAMO][静默] 安装重试 5 次都失败，已停止重试；点「静默自瞄自检」看具体原因")
+        return
+    end
+    task.delay(2, function()
+        if IsClosing or not State.SilentAim or Silent.installed then return end
+        Silent.Install()
+        if Silent.installed then
+            print("[NARAMO][静默] 重试安装成功")
+        else
+            Silent.Retry()
+        end
+    end)
+end
+
+function Silent.SetEnabled(on)
+    on = on and true or false
+    State.SilentAim = on
+    if on then
+        Silent.tries = 0
+        Silent.shots, Silent.rewrites, Silent.would, Silent.skipped, Silent.failed = 0, 0, 0, 0, 0
+        Silent.logged = 0
+        local ok, why = Silent.Install()
+        print("[NARAMO][静默] " .. (ok and ("已开启：" .. tostring(why))
+            or ("开启失败：" .. tostring(why) .. "（点「静默自瞄自检」看详情）")))
+        if not ok then Silent.Retry() end
+    elseif Silent.installed then
+        Silent.Uninstall()
+        print(string.format("[NARAMO][静默] 已关闭（拦截 %d / 改写 %d / 未改写 %d / 失败退回 %d）",
+            Silent.shots, Silent.rewrites, Silent.skipped, Silent.failed))
+    end
+    return State.SilentAim
+end
+
+-- 自检：执行器 API、开火模块、安装状态、拦截统计一次看全（发反馈时直接抄这段）
+function Silent.SelfCheck()
+    local lines = {}
+    local function Add(s) lines[#lines + 1] = s end
+    Add("静默自瞄: " .. (State.SilentAim and "开" or "关")
+        .. " | 干跑: " .. (State.SilentDryRun and "开" or "关")
+        .. " | FireServerNew: " .. (Silent.installed and "已被替换" or "原版"))
+    Add(string.format("执行器: hookfunction=%s getrawmetatable=%s newcclosure=%s getnamecallmethod=%s",
+        type(hookfunction), type(getrawmetatable), type(newcclosure), type(getnamecallmethod)))
+
+    local rs = game:GetService("ReplicatedStorage")
+    local gr = rs:FindFirstChild("GunRemotes")
+    Add("GunRemotes: " .. (gr and gr:GetFullName() or "没找到"))
+    if gr then
+        local ok, gm = pcall(require, gr)
+        if ok and type(gm) == "table" then
+            local proj = gm.Projectile
+            if type(proj) == "table" then
+                local names = {}
+                for k, v in pairs(proj) do
+                    if type(k) == "string" and type(v) == "function" then
+                        table.insert(names, k)
+                        if #names >= 24 then break end
+                    end
+                end
+                table.sort(names)
+                Add("Projectile 函数: " .. (#names > 0 and table.concat(names, ", ") or "（无）"))
+            else
+                Add("GunRemotes.Projectile 不是表")
+            end
+        else
+            Add("require GunRemotes 失败: " .. tostring(gm))
+        end
+    end
+
+    -- 如果 FireServerNew 被枪脚本缓存、拦截恒为 0，下一步就改这条最深的路（发包模块）
+    local packetMod = nil
+    pcall(function()
+        for _, d in ipairs(rs:GetDescendants()) do
+            if d:IsA("ModuleScript") and string.find(string.lower(d.Name), "gunpacket", 1, true) then
+                packetMod = d
+                break
+            end
+        end
+    end)
+    Add("GunPackets 模块: " .. (packetMod and packetMod:GetFullName() or "没找到"))
+
+    Add(string.format("统计: 拦截 %d / 改写 %d / 本来会改写 %d / 未改写 %d / 改写失败退回 %d",
+        Silent.shots, Silent.rewrites, Silent.would, Silent.skipped, Silent.failed))
+    Add("最近目标: " .. tostring(Silent.targetName or "无")
+        .. (Silent.targetDist and string.format("（%.0f studs）", Silent.targetDist) or ""))
+    if State.SilentAim and Silent.installed and Silent.shots == 0 then
+        Add("提示: 已挂上但还没拦截到开火 —— 开一枪再看；开过枪还是 0，说明枪脚本把函数缓存了")
+    end
+    return table.concat(lines, "\n")
+end
+end   -- 静默自瞄段结束
+
+-- ============================ 持枪自动开火（模拟鼠标按住左键） ============================
+-- 检测到手上是枪（判定同「仅持枪时自瞄」）就模拟按住鼠标左键：
+--   全自动枪 → 一直开火；半自动枪 → 按住只响一发，打开「改用连点」才会持续打。
+-- 收枪 / 换非枪工具 / 死亡 / 聊天框聚焦 / 关开关 / 关脚本 都会自动松开。
+-- 点击位置固定在屏幕左下角，避开我们自己的面板和游戏 UI；
+-- 执行器不支持「按住」时自动降级成连点，不会一动不动。
+local AutoFire = {
+    thread = nil, held = false, method = nil, lastTool = nil, forceClick = false,
+    pressAt = nil, holdVerified = nil,
+}
+
+do
+local function AutoFirePoint()
+    local vp = Vector2.new(1920, 1080)
+    pcall(function() vp = workspace.CurrentCamera.ViewportSize end)
+    return 10, math.max(10, math.floor(vp.Y) - 20)
+end
+
+-- 按住：优先 VirtualInputManager（引擎级输入，游戏里是「真的按住」），
+-- 其次执行器的 mouse1press。返回用到的通道，松开时按同一个通道放。
+-- 注意：这里刻意不发 SendMouseMoveEvent —— 那会把第一人称视角甩到屏幕角落。
+local function AutoFirePress()
+    local x, y = AutoFirePoint()
+    local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+    if okVim and vim then
+        local ok = pcall(function()
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        end)
+        if ok then return "VirtualInputManager" end
+    end
+    local okFn, fn = pcall(function() return mouse1press end)
+    if okFn and type(fn) == "function" and pcall(fn) then return "mouse1press" end
+    return nil
+end
+
+-- 松开：两条通道都放一遍，避免按住/松开不是同一个 API 时卡住
+local function AutoFireRelease(method)
+    local x, y = AutoFirePoint()
+    pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+    local okFn, fn = pcall(function() return mouse1release end)
+    if okFn and type(fn) == "function" then pcall(fn) end
+end
+
+-- 点一下（连点模式 / 降级兜底）
+local function AutoFireClickOnce()
+    local x, y = AutoFirePoint()
+    local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+    if okVim and vim then
+        local ok = pcall(function()
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+        if ok then return true end
+    end
+    local okFn, fn = pcall(function() return mouse1click end)
+    if okFn and type(fn) == "function" and pcall(fn) then return true end
+    local okPress, press = pcall(function() return mouse1press end)
+    local okRelease, release = pcall(function() return mouse1release end)
+    if okPress and okRelease and type(press) == "function" and type(release) == "function" then
+        if pcall(function() press(); task.wait(0.01); release() end) then return true end
+    end
+    return false
+end
+
+-- 现在能不能开火：活着 + 手上有枪
+local function AutoFireReady()
+    if IsClosing then return false, nil end
+    local char = LocalPlayer.Character
+    if not char then return false, nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false, nil end
+    local tool = GunSpeed.CurrentTool()
+    if not tool then return false, nil end
+    return GunSpeed.IsGunTool(tool), tool
+end
+
+function AutoFire.Stop()
+    if AutoFire.thread then pcall(task.cancel, AutoFire.thread); AutoFire.thread = nil end
+    if AutoFire.held then AutoFireRelease(AutoFire.method) end
+    AutoFire.held, AutoFire.method, AutoFire.lastTool = false, nil, nil
+    AutoFire.forceClick = false
+    AutoFire.pressAt, AutoFire.holdVerified = nil, nil
+end
+
+function AutoFire.Start()
+    AutoFire.Stop()
+    AutoFire.thread = TrackThread(task.spawn(function()
+        local lastClick = 0
+        local warned = false
+        while State.AutoFire and not IsClosing do
+            local okG, gun, tool = pcall(AutoFireReady)
+            gun = okG and gun or false
+            local focused, menuOpen = false, false
+            pcall(function() focused = UserInputService:GetFocusedTextBox() ~= nil end)
+            pcall(function() menuOpen = game:GetService("GuiService").MenuIsOpen end)
+
+            if gun and not focused and not menuOpen then
+                -- 从「长按」切到「连点」时先把按住的那一下松开，不然会一直算按住
+                if (State.AutoFireClick or AutoFire.forceClick) and AutoFire.held then
+                    AutoFireRelease(AutoFire.method)
+                    AutoFire.held, AutoFire.method, AutoFire.lastTool = false, nil, nil
+                end
+                if State.AutoFireClick or AutoFire.forceClick then
+                    local gap = math.clamp((tonumber(State.AutoFireIntervalMs) or 80) / 1000, 0.02, 1)
+                    local now = os.clock()
+                    if now - lastClick >= gap then
+                        lastClick = now
+                        AutoFireClickOnce()
+                    end
+                else
+                    -- 长按：刚拿上枪 / 换了另一把枪 → 重新按一次（旧的那次先松开）
+                    if not AutoFire.held or AutoFire.lastTool ~= tool then
+                        if AutoFire.held then AutoFireRelease(AutoFire.method) end
+                        AutoFire.held, AutoFire.method = false, nil
+                        local method = AutoFirePress()
+                        if method then
+                            AutoFire.held, AutoFire.method = true, method
+                            AutoFire.lastTool = tool
+                            AutoFire.pressAt, AutoFire.holdVerified = os.clock(), nil
+                        else
+                            AutoFire.forceClick = true
+                            if not warned then
+                                warned = true
+                                print("[NARAMO] 自动开火: 这个执行器不支持模拟按住，已自动改用连点")
+                            end
+                        end
+                    end
+                end
+
+                -- 按住 0.6 秒后回头看输入状态：如果游戏根本没收到底部按下的状态，
+                -- 说明这个执行器的虚拟输入不进鼠标状态机，直接降级成连点（否则会干等着不开火）
+                if AutoFire.held and not AutoFire.holdVerified and AutoFire.pressAt
+                    and (os.clock() - AutoFire.pressAt) >= 0.6 then
+                    local pressed = true
+                    pcall(function()
+                        pressed = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+                    end)
+                    AutoFire.holdVerified = true
+                    if not pressed then
+                        AutoFireRelease(AutoFire.method)
+                        AutoFire.held, AutoFire.method, AutoFire.lastTool = false, nil, nil
+                        AutoFire.forceClick = true
+                        if not warned then
+                            warned = true
+                            print("[NARAMO] 自动开火: 长按没被游戏识别，已自动改用连点")
+                        end
+                    end
+                end
+            else
+                if AutoFire.held then
+                    AutoFireRelease(AutoFire.method)
+                    AutoFire.held, AutoFire.method, AutoFire.lastTool = false, nil, nil
+                end
+            end
+
+            local waitTime = (State.AutoFireClick or AutoFire.forceClick) and 0.02 or 0.12
+            task.wait(waitTime)
+        end
+        if AutoFire.held then AutoFireRelease(AutoFire.method) end
+        AutoFire.held, AutoFire.method, AutoFire.lastTool = false, nil, nil
+        AutoFire.thread = nil
+    end))
+end
+
+function AutoFire.SetEnabled(on)
+    on = on and true or false
+    State.AutoFire = on
+    if on then
+        AutoFire.Start()
+        print("[NARAMO] 自动开火: 已开启（" .. (State.AutoFireClick and "连点" or "长按")
+            .. "模式，手里是枪才会开火）")
+    else
+        local was = (AutoFire.thread ~= nil) or AutoFire.held
+        AutoFire.Stop()
+        if was then print("[NARAMO] 自动开火: 已关闭，鼠标已松开") end
+    end
+    return State.AutoFire
+end
+end   -- 自动开火段结束
+
 local function DisableAllFeatures()
     for _, key in ipairs({ "InfJump", "Noclip", "FullBright", "ESPEnabled", "AimbotEnabled",
                            "NPCESPEnabled", "NPCAimEnabled", "WalkSpeedEnabled", "InfiniteAmmo",
                            "InstantInteract", "WrenchRepair", "WrenchAutoRepair", "SkyWalk",
-                           "VehiclePushEnabled", "VehicleTurnEnabled", "VehicleHoverEnabled", "WrenchTour" }) do
+                           "VehiclePushEnabled", "VehicleTurnEnabled", "VehicleHoverEnabled", "WrenchTour",
+                           "SilentAim", "AutoFire" }) do
         SetControl(key, false)   -- 走控件回填，开关显示也会一起复位
     end
     print("触发了安全机制：已关闭所有功能")
@@ -2347,7 +2857,8 @@ local function CleanupAndClose()
                           "ESPEnabled", "AimbotEnabled", "NPCESPEnabled", "NPCAimEnabled",
                           "WalkSpeedEnabled", "InfiniteAmmo", "AntiIdle",
                           "InstantInteract", "WrenchRepair", "WrenchAutoRepair", "SkyWalk",
-                          "VehiclePushEnabled", "VehicleTurnEnabled", "VehicleHoverEnabled", "WrenchTour" }) do
+                          "VehiclePushEnabled", "VehicleTurnEnabled", "VehicleHoverEnabled", "WrenchTour",
+                          "SilentAim", "AutoFire" }) do
         SetControl(key, false)
     end
     SetControl("AutoCheck", false)
@@ -2955,6 +3466,10 @@ CreateButton(AimbotPage, "检测当前手持武器 (算不算枪 / 自瞄会不�
     local msg = string.format("手上 %s → %s（%s）", tostring(name or "空手"),
         isGun and "是枪" or "不是枪", tostring(why))
     print("[NARAMO] 持枪检测: " .. msg)
+    print(string.format("[NARAMO] 自动开火: %s | %s | 连点间隔 %d ms",
+        State.AutoFire and "开" or "关",
+        AutoFire.held and "正在按住左键" or (State.AutoFireClick and "连点模式" or "空闲"),
+        math.floor(tonumber(State.AutoFireIntervalMs) or 0)))
     pcall(function()
         game:GetService("StarterGui"):SetCore("SendNotification", {
             Title = "NARAMO 持枪检测",
@@ -2963,6 +3478,13 @@ CreateButton(AimbotPage, "检测当前手持武器 (算不算枪 / 自瞄会不�
         })
     end)
 end)
+-- 持枪自动开火：手上是枪就模拟按住左键（收枪 / 死亡 / 聊天框聚焦 / 关脚本会自动松开）
+-- 全自动枪用长按就够了；半自动枪按住只响一发，打开「改用连点」才会持续打
+CreateToggle(AimbotPage, "持枪自动开火 (检测到枪就按住左键)", "AutoFire", State.AutoFire, function(v)
+    AutoFire.SetEnabled(v)
+end)
+CreateToggle(AimbotPage, "自动开火·改用连点 (半自动枪用)", "AutoFireClick", State.AutoFireClick, function(v) State.AutoFireClick = v end)
+CreateSlider(AimbotPage, "自动开火·连点间隔 (毫秒)", "AutoFireIntervalMs", 20, 1000, State.AutoFireIntervalMs, function(v) State.AutoFireIntervalMs = v end)
 CreateToggle(AimbotPage, "显示 FOV 圈", "ShowFOV", State.ShowFOV, function(v) State.ShowFOV = v end)
 CreateSlider(AimbotPage, "FOV 范围", "AimbotFOV", 20, 500, State.AimbotFOV, function(v) State.AimbotFOV = v end)
 CreateSlider(AimbotPage, "最远自瞄距离 (studs)", "AimMaxDist", 50, 5000, State.AimMaxDist, function(v) State.AimMaxDist = v end)
@@ -2986,6 +3508,18 @@ CreateToggle(AimbotPage, "实读游戏配置 (仅新枪，可能影响拿枪)", 
         if tool then GunSpeed.cache[tool.Name] = nil end
         GunSpeed.Refresh(tool and tool.Name)
     end
+end)
+
+-- 静默自瞄：不转相机，改写开火方向（原理同 xk 的无声自瞄，落到 GunRemotes.Projectile.FireServerNew）
+-- 目标按世界距离选，不受 FOV 限制；默认关，先按「静默自瞄自检」确认钩子挂上了再开。
+CreateToggle(AimbotPage, "静默自瞄 (改写开火方向, 相机不动)", "SilentAim", State.SilentAim, function(v)
+    Silent.SetEnabled(v)
+end)
+CreateSlider(AimbotPage, "静默自瞄距离 (studs, 不看 FOV)", "SilentRange", 30, 2000, State.SilentRange, function(v) State.SilentRange = v end)
+CreateToggle(AimbotPage, "静默自瞄·队伍检测", "SilentTeamCheck", State.SilentTeamCheck, function(v) State.SilentTeamCheck = v end)
+CreateToggle(AimbotPage, "静默自瞄·只记录不改 (干跑, 首次测试用)", "SilentDryRun", State.SilentDryRun, function(v) State.SilentDryRun = v end)
+CreateButton(AimbotPage, "静默自瞄自检 (钩子 / 开火函数 / 统计)", function()
+    print("[NARAMO][静默自检]\n" .. Silent.SelfCheck())
 end)
 
 -- 打僵尸 / NPC 页面（活动期间用；绘制与自瞄是两个独立开关，互不依赖）
@@ -4164,6 +4698,9 @@ local function GetPredictPosition(part)
     end
     return aim
 end
+
+-- 静默自瞄也复用这一份弹道预判（开火那一刻现算，目标点/提前量才准）
+Silent.predict = GetPredictPosition
 
 local function GetClosestTarget()
     local closest, closestDist = nil, State.AimbotFOV
