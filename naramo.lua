@@ -71,8 +71,9 @@
 --          让光标零位移；松开只用按下时的同一条通道，另一条仅在失败时兜底。
 --          如果这个点正好压在我们自己的面板上，会先把 ScreenGui 关一瞬间再点
 --          （同一帧内恢复，看不出闪），避免把自己的开关点掉。
--- 新增 33: 「PM 靠近自动维修」节奏可调 —— 同一台设备的冷却从写死的 1 秒降到默认 500ms
---          （面板可调 100–5000ms），主循环扫描间隔默认 100ms（可调 30–500ms）；
+-- 新增 33: 「PM 靠近自动维修」节奏可调 —— 同一台设备的冷却从写死的 1 秒降到默认 500ms，
+--          主循环扫描间隔默认 100ms；两个滑块都可以拉到 0（0 = 修完立刻再修 / 每帧扫一次），
+--          扫描还加了「中心距离粗筛」，每帧扫也不会把帧数吃掉。
 --          一轮之内的补耐久仍然是 0 间隔逐帧连发，不受这两个值影响
 -- ============================================================
 
@@ -87,7 +88,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-07 r59 · 自动维修冷却/扫描间隔可调（默认 500ms / 100ms）"
+local SCRIPT_VERSION = "2026-11-07 r60 · 自动维修冷却/扫描可调到 0（刷经验：0ms + 阈值 100%）"
 
 -- ============================ 内置管理员名单 ============================
 -- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
@@ -2431,8 +2432,13 @@ local function WrenchFindTarget(maxDist)
     if ok and type(tagged) == "table" then
         for _, part in ipairs(tagged) do
             if part:IsA("BasePart") and part:IsDescendantOf(workspace) then
-                local d = WrenchSurfaceDistance(part, pos)
-                if d <= maxDist and (bestD == nil or d < bestD) then best, bestD = part, d end
+                -- 先做便宜的中心距离粗筛：GetClosestPointOnSurface 比较贵，
+                -- 扫描间隔调到 0（每帧扫）时这一步能把大部分无关设备直接跳过
+                local rough = (part.Position - pos).Magnitude
+                if rough <= maxDist + part.Size.Magnitude then
+                    local d = WrenchSurfaceDistance(part, pos)
+                    if d <= maxDist and (bestD == nil or d < bestD) then best, bestD = part, d end
+                end
             end
         end
     end
@@ -2598,9 +2604,9 @@ local function WrenchAutoTick()
     end
 
     -- 读不到耐久 / 没有上限的读数，都判断不了满没满：给个长冷却，别一直空打
-    -- 冷却从「这一轮开始」算起，默认 500ms；要更快就调小（最小 100ms）
+    -- 冷却从「这一轮开始」算起，默认 500ms；0 = 修完立刻可以再修（刷经验用）
     local waitFor = (cur == nil or mx == nil) and 30
-        or (math.clamp(tonumber(State.WrenchAutoCooldownMs) or 500, 100, 60000) / 1000)
+        or (math.clamp(tonumber(State.WrenchAutoCooldownMs) or 500, 0, 60000) / 1000)
     if (WrenchAutoSeen[part] or 0) > now then return end
     WrenchAutoSeen[part] = now + waitFor
 
@@ -2633,8 +2639,14 @@ local function WrenchStartLoop()
     if WrenchThread then return end
     WrenchThread = task.spawn(function()
         while not IsClosing and (State.WrenchRepair or State.WrenchAutoRepair) do
-            -- 扫描间隔可调（默认 100ms）：调小能更快发现刚掉耐久的设备，代价是扫描更频繁
-            task.wait(math.clamp((tonumber(State.WrenchAutoTickMs) or 100) / 1000, 0.03, 1))
+            -- 扫描间隔可调（默认 100ms）：0 = 每帧扫一次（刷经验时最灵敏）。
+            -- 0 不能直接 task.wait(0)，用 Heartbeat 明确只让出一帧，免得空转把帧数吃掉
+            local tick = math.clamp((tonumber(State.WrenchAutoTickMs) or 100) / 1000, 0, 1)
+            if tick <= 0 then
+                RunService.Heartbeat:Wait()
+            else
+                task.wait(tick)
+            end
             if not WrenchBusy then
                 -- 界面上已经没有小游戏了就清掉「已处理」标记，等下一次弹出
                 local any = false
@@ -3481,12 +3493,12 @@ CreateSlider(MainPage, "自动维修距离 (studs)", "WrenchAutoDist", 5, 60, St
     State.WrenchAutoDist = v
 end)
 -- 自动维修的速度由两个参数决定：
---   冷却 = 同一台设备隔多久才允许再修一轮（默认 500ms，越小事后重连越快）
---   扫描 = 主循环隔多久看一眼身边有没有掉耐久的设备（默认 100ms）
+--   冷却 = 同一台设备隔多久才允许再修一轮（默认 500ms；0 = 不留冷却，修完立刻可以再修）
+--   扫描 = 主循环隔多久看一眼身边有没有掉耐久的设备（默认 100ms；0 = 每帧扫一次）
 -- 一轮之内是 0 间隔逐帧连发，直到耐久满，所以这两个才是「每次维修后的间隔」
-CreateSlider(MainPage, "自动维修·同一设备冷却 (毫秒)", "WrenchAutoCooldownMs", 100, 5000, State.WrenchAutoCooldownMs,
+CreateSlider(MainPage, "自动维修·同一设备冷却 (毫秒, 0=不冷却)", "WrenchAutoCooldownMs", 0, 5000, State.WrenchAutoCooldownMs,
     function(v) State.WrenchAutoCooldownMs = v end)
-CreateSlider(MainPage, "自动维修·扫描间隔 (毫秒)", "WrenchAutoTickMs", 30, 500, State.WrenchAutoTickMs,
+CreateSlider(MainPage, "自动维修·扫描间隔 (毫秒, 0=每帧)", "WrenchAutoTickMs", 0, 500, State.WrenchAutoTickMs,
     function(v) State.WrenchAutoTickMs = v end)
 -- PM 全场自动维修：自动跑遍全场可修设备（定高滑行，穿墙走直线，不吃虚空）
 CreateToggle(MainPage, "PM全场自动维修", "WrenchTour", State.WrenchTour, function(v)
