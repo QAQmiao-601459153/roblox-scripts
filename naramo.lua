@@ -58,6 +58,22 @@
 --          NARAMO_Configs/_vehicle_points.json，不跟配置走，换配置不会丢），
 --          点坐标点直接传送、点「删」删除；记录坐标也不再要求坐在车上，
 --          步行时用「记录脚下位置」（从角色身上向下打射线取真实地面点）
+-- 新增 30: 「持枪自动开火」新增「附近有人自动暂停」—— 150 格内有真人玩家就立刻
+--          松开左键，人走出 150 格后再自动恢复开火；距离可调，队友也算
+--          （队友一样看得见你在乱开枪）。掉线/重生/关开关都会把暂停状态清干净
+-- 新增 31: 「附近有人自动暂停」新增「不屏蔽名单」—— 名单里的人（比如自己的小号）
+--          站在旁边也不会触发暂停，自动开火照常打；面板上可加/删/清空，
+--          名字按「用户名或显示名」不区分大小写匹配，跟着配置一起存
+-- 修复 32: 暂停后恢复自动开火，视角会偏 —— 原来点击点写死屏幕左下角，而且松开时
+--          还无条件再调一次执行器的 mouse1release。两件事都等于把虚拟鼠标从准星
+--          拽到别处，游戏按鼠标位置算朝向 / 角色跟着转，每暂停一次视角就歪一点。
+--          现在按下、松开、连点都点在「鼠标当前所在位置」（锁定时就是屏幕正中），
+--          让光标零位移；松开只用按下时的同一条通道，另一条仅在失败时兜底。
+--          如果这个点正好压在我们自己的面板上，会先把 ScreenGui 关一瞬间再点
+--          （同一帧内恢复，看不出闪），避免把自己的开关点掉。
+-- 新增 33: 「PM 靠近自动维修」节奏可调 —— 同一台设备的冷却从写死的 1 秒降到默认 500ms
+--          （面板可调 100–5000ms），主循环扫描间隔默认 100ms（可调 30–500ms）；
+--          一轮之内的补耐久仍然是 0 间隔逐帧连发，不受这两个值影响
 -- ============================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -71,7 +87,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-06 r55 · 配置改为选中、车辆坐标收藏、步行取脚下坐标"
+local SCRIPT_VERSION = "2026-11-07 r59 · 自动维修冷却/扫描间隔可调（默认 500ms / 100ms）"
 
 -- ============================ 内置管理员名单 ============================
 -- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
@@ -101,7 +117,10 @@ local State = {
     InstantInteract = false,
     -- PM 秒维修：检测到维修小游戏界面就直接发 Repair，跳过小游戏
     -- WrenchAutoRepair：靠近可修设备（WrenchAutoDist 内）就自动补满耐久
+    -- WrenchAutoCooldownMs：同一台设备两次自动维修之间的最小间隔（毫秒）
+    -- WrenchAutoTickMs：主循环多久扫一次身边的可修设备（毫秒）
     WrenchRepair = false, WrenchAutoRepair = false, WrenchAutoDist = 20,
+    WrenchAutoCooldownMs = 500, WrenchAutoTickMs = 100,
     -- 全场自动维修：逐个巡回全场可修设备；WrenchTourPoints 是可选的预设坐标兜底
     WrenchTour = false, WrenchTourSpeed = 50, WrenchTourArrive = 12, WrenchTourPoints = {}, WrenchTourHold = 8,
     -- 巡回时标记当前目标（高亮 + 头顶圆点）
@@ -126,6 +145,12 @@ local State = {
     -- 持枪自动开火：检测到手上有枪就模拟按住左键
     -- AutoFireClick = 半自动枪改用连点；AutoFireIntervalMs = 连点间隔（毫秒）
     AutoFire = false, AutoFireClick = false, AutoFireIntervalMs = 80,
+    -- 附近有人自动暂停：AutoFireSafeDist 格（面板上按 m 显示）内有真人玩家就不开火，
+    -- 人走远后自动继续。距离和 ESP 上的距离是同一套（这个游戏 1 stud 就显示成 1m）
+    AutoFireSafe = true, AutoFireSafeDist = 150,
+    -- 不屏蔽名单：名单里的人（比如自己的小号）站在附近也不会触发上面的暂停；
+    -- 元素是名字字符串，比较时不区分大小写，用户名和显示名都算
+    AutoFireSafeIgnore = {},
     -- 弹速自动读取（TREK GunConfig）+ 下坠补偿：读不到配置时自动退回上面的手填值
     -- AimSpeedLiveRead 默认关：实测 require 游戏配置会让枪拿不上，平时只用内置表
     AimSpeedAuto = true, AimDropComp = true, AimSpeedLiveRead = false,
@@ -1815,23 +1840,78 @@ end   -- 静默自瞄段结束
 local AutoFire = {
     thread = nil, held = false, method = nil, lastTool = nil, forceClick = false,
     pressAt = nil, holdVerified = nil,
+    -- 附近有人自动暂停的现场信息（面板「检测当前手持武器」会读它）
+    safePaused = false, nearDist = nil, nearName = nil,
 }
 
 do
+-- 鼠标现在是不是压在我们自己的面板上？返回 true / false，查不了返回 nil
+-- （面板默认是屏幕正中 600x400，正常游玩时鼠标经常就在它上面）
+local function AutoFireOverOwnGui(x, y)
+    local gui = NARAMO_GuiRef
+    if not gui then return nil end
+    local ok, objs = pcall(function() return PlayerGui:GetGuiObjectsAtPosition(x, y) end)
+    if not ok or type(objs) ~= "table" then return nil end
+    for _, obj in ipairs(objs) do
+        if obj:IsDescendantOf(gui) then return true end
+    end
+    return false
+end
+
+-- 点击点：优先点「鼠标现在所在的位置」—— 点在这里等于鼠标没有动，游戏就不会
+-- 因为鼠标被挪走而把视角/角色转向别处。
+-- 之前写死屏幕左下角 (10, 视口高-20)，每按下一次都等于把虚拟鼠标从准星拽到左下角，
+-- 有些枪是按鼠标位置算朝向/让角色转身的 —— 暂停一次→恢复一次，视角就偏一点。
+-- 鼠标被游戏锁在中间（第一人称）时直接用屏幕正中，连读鼠标位置都不用。
 local function AutoFirePoint()
     local vp = Vector2.new(1920, 1080)
     pcall(function() vp = workspace.CurrentCamera.ViewportSize end)
-    return 10, math.max(10, math.floor(vp.Y) - 20)
+    local centerX, centerY = math.floor(vp.X * 0.5), math.floor(vp.Y * 0.5)
+    local cornerX, cornerY = 10, math.max(10, math.floor(vp.Y) - 20)
+
+    local locked = false
+    pcall(function() locked = UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter end)
+    if locked then
+        -- 锁定状态下光标本来就在正中，点正中 = 零位移
+        local over = AutoFireOverOwnGui(centerX, centerY)
+        if over == nil then return cornerX, cornerY, false end
+        return centerX, centerY, over
+    end
+
+    local ok, pos = pcall(function() return UserInputService:GetMouseLocation() end)
+    if not (ok and typeof(pos) == "Vector2") then return centerX, centerY, false end
+    local x, y = math.floor(pos.X), math.floor(pos.Y)
+    if x < 0 or y < 0 or x > vp.X or y > vp.Y then return centerX, centerY, false end
+
+    local over = AutoFireOverOwnGui(x, y)
+    if over == nil then
+        -- 查不了自家界面：退回老的左下角，宁可视角偏一点也不能点到自己的开关
+        return cornerX, cornerY, false
+    end
+    return x, y, over
+end
+
+-- 发一次鼠标事件。如果这个点正压在我们自己的面板上，先把 ScreenGui 关掉一瞬间再发：
+-- 面板被临时禁用 -> 这一下点不到面板（不会把开关点掉），点完立刻恢复，
+-- 整个过程在同一帧内完成，画面不会闪。
+local function AutoFireSend(x, y, overOwn, fn)
+    local gui = NARAMO_GuiRef
+    if overOwn and gui and gui.Enabled then
+        gui.Enabled = false
+        local ok = pcall(fn)
+        gui.Enabled = true
+        return ok
+    end
+    return pcall(fn)
 end
 
 -- 按住：优先 VirtualInputManager（引擎级输入，游戏里是「真的按住」），
 -- 其次执行器的 mouse1press。返回用到的通道，松开时按同一个通道放。
--- 注意：这里刻意不发 SendMouseMoveEvent —— 那会把第一人称视角甩到屏幕角落。
 local function AutoFirePress()
-    local x, y = AutoFirePoint()
+    local x, y, over = AutoFirePoint()
     local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
     if okVim and vim then
-        local ok = pcall(function()
+        local ok = AutoFireSend(x, y, over, function()
             vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
         end)
         if ok then return "VirtualInputManager" end
@@ -1841,23 +1921,40 @@ local function AutoFirePress()
     return nil
 end
 
--- 松开：两条通道都放一遍，避免按住/松开不是同一个 API 时卡住
+-- 松开：用「按下去的那条通道」放；另一条只在第一条失败时兜底。
+-- 原来是无条件两条都放 —— 执行器的 mouse1release 很多会顺手把鼠标挪到 (0,0)，
+-- 于是每暂停一次就把视角往左上拽一下，人走远恢复后视角自然就不在原地了。
 local function AutoFireRelease(method)
-    local x, y = AutoFirePoint()
-    pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
-    end)
-    local okFn, fn = pcall(function() return mouse1release end)
-    if okFn and type(fn) == "function" then pcall(fn) end
+    local x, y, over = AutoFirePoint()
+    local vimOk = false
+    local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+    if okVim and vim then
+        vimOk = AutoFireSend(x, y, over, function()
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+    end
+    if method ~= "VirtualInputManager" or not vimOk then
+        local okFn, fn = pcall(function() return mouse1release end)
+        if okFn and type(fn) == "function" then pcall(fn) end
+        return
+    end
+    -- VIM 松完再确认一次：万一游戏没收到（事件被吞），才用执行器函数补一刀。
+    -- 平时这条路不走，也就不会每次暂停都多调一次 mouse1release 把鼠标拖走。
+    task.wait(0.03)
+    local stillDown = false
+    pcall(function() stillDown = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end)
+    if stillDown then
+        local okFn, fn = pcall(function() return mouse1release end)
+        if okFn and type(fn) == "function" then pcall(fn) end
+    end
 end
 
 -- 点一下（连点模式 / 降级兜底）
 local function AutoFireClickOnce()
-    local x, y = AutoFirePoint()
+    local x, y, over = AutoFirePoint()
     local okVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
     if okVim and vim then
-        local ok = pcall(function()
+        local ok = AutoFireSend(x, y, over, function()
             vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
             vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
         end)
@@ -1873,6 +1970,11 @@ local function AutoFireClickOnce()
     return false
 end
 
+-- 给面板上的「视角自检」按钮用：返回 当前会用的点击点 x, y, 是否压在自己面板上
+function AutoFire.ClickPoint()
+    return AutoFirePoint()
+end
+
 -- 现在能不能开火：活着 + 手上有枪
 local function AutoFireReady()
     if IsClosing then return false, nil end
@@ -1885,12 +1987,80 @@ local function AutoFireReady()
     return GunSpeed.IsGunTool(tool), tool
 end
 
+-- 不屏蔽名单：名单里的人（比如自己的小号）不算「附近有人」，不会让自动开火暂停。
+-- 存在 State.AutoFireSafeIgnore 里，元素是名字；比较时统一小写，
+-- 用户名（p.Name）和显示名（p.DisplayName）都认，这样你按游戏里看到的名字加也行。
+function AutoFire.IsIgnored(name)
+    if type(name) ~= "string" or name == "" then return false end
+    local list = State.AutoFireSafeIgnore
+    if type(list) ~= "table" then return false end
+    local lower = string.lower(name)
+    for _, n in ipairs(list) do
+        if type(n) == "string" and string.lower(n) == lower then return true end
+    end
+    return false
+end
+
+-- 加一个名字：去首尾空格、去重；返回 ok, 说明
+function AutoFire.AddIgnore(name)
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return false, "名字是空的" end
+    if type(State.AutoFireSafeIgnore) ~= "table" then State.AutoFireSafeIgnore = {} end
+    if AutoFire.IsIgnored(name) then return false, "这个名字已经在不屏蔽名单里了" end
+    table.insert(State.AutoFireSafeIgnore, name)
+    return true, name
+end
+
+-- 按序号删一个名字；返回 ok, 被删掉的名字
+function AutoFire.RemoveIgnore(index)
+    local list = State.AutoFireSafeIgnore
+    if type(list) ~= "table" or not list[index] then return false, nil end
+    local name = table.remove(list, index)
+    return true, name
+end
+
+-- 附近有没有别的真人玩家（队友也算）：返回 最近距离, 名字
+-- 距离按「我的 HumanoidRootPart → 他的 HumanoidRootPart」算，和 ESP 上显示的 m 是同一套
+-- （这个游戏 1 stud 就显示成 1m，所以阈值 150 就是面板上看到的 150m）
+-- 死掉的角色不算（死亡后会在地上留一会儿）；刚重生、Humanoid 还没挂上的照算，毕竟人已经在那了
+-- 「不屏蔽名单」里的人直接跳过：他们站在旁边也不算有人，自动开火照常打
+local function AutoFireNearbyPlayer()
+    local myChar = LocalPlayer.Character
+    local myPart = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    local myPos = myPart and myPart.Position or nil
+    if not myPos then
+        local cam = workspace.CurrentCamera
+        myPos = cam and cam.CFrame.Position or nil
+    end
+    if not myPos then return nil, nil end
+
+    local limit = tonumber(State.AutoFireSafeDist) or 150
+    local best, bestName = nil, nil
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local char = p.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local part = char and (char:FindFirstChild("HumanoidRootPart")
+                or char:FindFirstChildWhichIsA("BasePart"))
+            local ignored = AutoFire.IsIgnored(p.Name) or AutoFire.IsIgnored(p.DisplayName)
+            if part and (not hum or hum.Health > 0) and not ignored then
+                local d = (part.Position - myPos).Magnitude
+                if d <= limit and (not best or d < best) then
+                    best, bestName = d, p.Name
+                end
+            end
+        end
+    end
+    return best, bestName
+end
+
 function AutoFire.Stop()
     if AutoFire.thread then pcall(task.cancel, AutoFire.thread); AutoFire.thread = nil end
     if AutoFire.held then AutoFireRelease(AutoFire.method) end
     AutoFire.held, AutoFire.method, AutoFire.lastTool = false, nil, nil
     AutoFire.forceClick = false
     AutoFire.pressAt, AutoFire.holdVerified = nil, nil
+    AutoFire.safePaused, AutoFire.nearDist, AutoFire.nearName = false, nil, nil
 end
 
 function AutoFire.Start()
@@ -1898,6 +2068,7 @@ function AutoFire.Start()
     AutoFire.thread = TrackThread(task.spawn(function()
         local lastClick = 0
         local warned = false
+        local lastPaused = false
         while State.AutoFire and not IsClosing do
             local okG, gun, tool = pcall(AutoFireReady)
             gun = okG and gun or false
@@ -1905,7 +2076,27 @@ function AutoFire.Start()
             pcall(function() focused = UserInputService:GetFocusedTextBox() ~= nil end)
             pcall(function() menuOpen = game:GetService("GuiService").MenuIsOpen end)
 
-            if gun and not focused and not menuOpen then
+            -- 附近有人自动暂停：只要 150 格内还有活着的玩家，这一轮就不开火（连点也不点）
+            -- 人一走远，paused 变回 false，下面会重新按下去 / 继续连点，不用手动重开开关
+            local nearDist, nearName = nil, nil
+            if State.AutoFireSafe then
+                local okNear, d, n = pcall(AutoFireNearbyPlayer)
+                if okNear then nearDist, nearName = d, n end
+            end
+            local paused = (nearDist ~= nil)
+            AutoFire.safePaused, AutoFire.nearDist, AutoFire.nearName = paused, nearDist, nearName
+            if paused ~= lastPaused then
+                lastPaused = paused
+                if paused then
+                    print(string.format(
+                        "[NARAMO] 自动开火: 附近 %.0f 格有玩家 %s（阈值 %d 格），已暂停；人走远后自动继续",
+                        nearDist, tostring(nearName), math.floor(tonumber(State.AutoFireSafeDist) or 150)))
+                else
+                    print("[NARAMO] 自动开火: 附近没人了，恢复自动开火")
+                end
+            end
+
+            if gun and not focused and not menuOpen and not paused then
                 -- 从「长按」切到「连点」时先把按住的那一下松开，不然会一直算按住
                 if (State.AutoFireClick or AutoFire.forceClick) and AutoFire.held then
                     AutoFireRelease(AutoFire.method)
@@ -1965,6 +2156,7 @@ function AutoFire.Start()
             end
 
             local waitTime = (State.AutoFireClick or AutoFire.forceClick) and 0.02 or 0.12
+            if paused then waitTime = math.max(waitTime, 0.1) end   -- 暂停时 10Hz 复查就够，别空转
             task.wait(waitTime)
         end
         if AutoFire.held then AutoFireRelease(AutoFire.method) end
@@ -1978,8 +2170,11 @@ function AutoFire.SetEnabled(on)
     State.AutoFire = on
     if on then
         AutoFire.Start()
+        local safe = State.AutoFireSafe
+            and string.format("，%d 格内有玩家会自动暂停", math.floor(tonumber(State.AutoFireSafeDist) or 150))
+            or "，附近有人也照打（附近有人暂停已关）"
         print("[NARAMO] 自动开火: 已开启（" .. (State.AutoFireClick and "连点" or "长按")
-            .. "模式，手里是枪才会开火）")
+            .. "模式，手里是枪才会开火" .. safe .. "；按下 / 松开都在鼠标原地发，不再把光标拽走）")
     else
         local was = (AutoFire.thread ~= nil) or AutoFire.held
         AutoFire.Stop()
@@ -2160,7 +2355,8 @@ local WrenchTune = {
     maxFires = 900,      -- 有耐久读数时最多连发多少次（约 15 秒 @60fps）
     stallFires = 120,    -- 耐久连续这么多次没涨就停手（约 2 秒，服务端冷却时别空打）
     unknownFires = 12,   -- 读不到耐久上限（没有 Values/Durability）时的固定连发次数
-    autoCooldown = 1.0,  -- 同一台设备两次自动维修之间的最小间隔（秒）
+    -- 「同一台设备的冷却」「主循环扫描间隔」已经挪到面板上（State.WrenchAutoCooldownMs /
+    -- State.WrenchAutoTickMs），这里不再写死
 }
 
 local function WrenchRemotes()
@@ -2288,7 +2484,7 @@ end
 
 -- 连发补耐久：两次 Repair 之间不留间隔（WrenchTune.gap = 0 时每帧发一次），
 -- 直到耐久补满 / 目标消失 / 连续一段时间没有进展。
--- 返回最后读到的耐久值（读不到时是 nil）。
+-- 返回 最后读到的耐久值（读不到时是 nil）, 是否卡住（耐久一直不涨 = 服务端在冷却）
 local function WrenchRepairUntilFull(repair, request, tool, part)
     if not part or not part:IsDescendantOf(workspace) then return nil end
     local cur, mx = WrenchDurability(part)
@@ -2296,6 +2492,7 @@ local function WrenchRepairUntilFull(repair, request, tool, part)
 
     local maxFires = (mx ~= nil) and WrenchTune.maxFires or WrenchTune.unknownFires
     local stall = 0
+    local stalled = false
 
     for _ = 1, maxFires do
         if not WrenchStillOn() then break end
@@ -2318,11 +2515,13 @@ local function WrenchRepairUntilFull(repair, request, tool, part)
             stall = 0                                          -- 还在涨：继续连发
         else
             stall = stall + 1
-            if mx ~= nil and stall >= WrenchTune.stallFires then break end   -- 服务端在冷却，别空打
+            if mx ~= nil and stall >= WrenchTune.stallFires then
+                stalled = true; break                          -- 服务端在冷却，别空打
+            end
         end
         cur = nv
     end
-    return cur
+    return cur, stalled
 end
 
 local function WrenchHandle()
@@ -2399,7 +2598,9 @@ local function WrenchAutoTick()
     end
 
     -- 读不到耐久 / 没有上限的读数，都判断不了满没满：给个长冷却，别一直空打
-    local waitFor = (cur == nil or mx == nil) and 30 or WrenchTune.autoCooldown
+    -- 冷却从「这一轮开始」算起，默认 500ms；要更快就调小（最小 100ms）
+    local waitFor = (cur == nil or mx == nil) and 30
+        or (math.clamp(tonumber(State.WrenchAutoCooldownMs) or 500, 100, 60000) / 1000)
     if (WrenchAutoSeen[part] or 0) > now then return end
     WrenchAutoSeen[part] = now + waitFor
 
@@ -2413,10 +2614,16 @@ local function WrenchAutoTick()
                 task.wait(0.1)
             end
             if request then pcall(function() request:FireServer(tool, part, "Durability") end) end
-            local after = WrenchRepairUntilFull(repair, request, tool, part)
+            local after, stalled = WrenchRepairUntilFull(repair, request, tool, part)
+            if stalled then
+                -- 服务端在冷却：怎么打耐久都不涨，这台先放 5 秒，
+                -- 免得把「同一设备冷却」调快之后一直对着它空打
+                WrenchAutoSeen[part] = os.clock() + 5
+            end
             local txt = "?"
             if tonumber(after) then txt = tostring(math.floor(tonumber(after))) end
-            print(string.format("[PM秒维修] 自动维修 %s → 耐久 %s", tostring(part.Name), txt))
+            print(string.format("[PM秒维修] 自动维修 %s → 耐久 %s%s", tostring(part.Name), txt,
+                stalled and "（耐久没涨，这台先放 5 秒）" or ""))
         end)
         WrenchBusy = false
     end)
@@ -2426,7 +2633,8 @@ local function WrenchStartLoop()
     if WrenchThread then return end
     WrenchThread = task.spawn(function()
         while not IsClosing and (State.WrenchRepair or State.WrenchAutoRepair) do
-            task.wait(0.1)
+            -- 扫描间隔可调（默认 100ms）：调小能更快发现刚掉耐久的设备，代价是扫描更频繁
+            task.wait(math.clamp((tonumber(State.WrenchAutoTickMs) or 100) / 1000, 0.03, 1))
             if not WrenchBusy then
                 -- 界面上已经没有小游戏了就清掉「已处理」标记，等下一次弹出
                 local any = false
@@ -2855,6 +3063,9 @@ end
 -- ============================ UI 构建 ============================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "NARAMO_UI"; ScreenGui.ResetOnSpawn = false; ScreenGui.Parent = PlayerGui
+-- 自动开火 / 反挂机点鼠标时要知道「这一下会不会点到自己面板」。
+-- 用全局名而不是顶层 local：文件头的「修复 11」说过顶层 local 有 200 个硬上限
+NARAMO_GuiRef = ScreenGui
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Size = UDim2.new(0, 600, 0, 400); MainFrame.Position = UDim2.new(0.5, -300, 0.5, -200)
@@ -3269,6 +3480,14 @@ end)
 CreateSlider(MainPage, "自动维修距离 (studs)", "WrenchAutoDist", 5, 60, State.WrenchAutoDist, function(v)
     State.WrenchAutoDist = v
 end)
+-- 自动维修的速度由两个参数决定：
+--   冷却 = 同一台设备隔多久才允许再修一轮（默认 500ms，越小事后重连越快）
+--   扫描 = 主循环隔多久看一眼身边有没有掉耐久的设备（默认 100ms）
+-- 一轮之内是 0 间隔逐帧连发，直到耐久满，所以这两个才是「每次维修后的间隔」
+CreateSlider(MainPage, "自动维修·同一设备冷却 (毫秒)", "WrenchAutoCooldownMs", 100, 5000, State.WrenchAutoCooldownMs,
+    function(v) State.WrenchAutoCooldownMs = v end)
+CreateSlider(MainPage, "自动维修·扫描间隔 (毫秒)", "WrenchAutoTickMs", 30, 500, State.WrenchAutoTickMs,
+    function(v) State.WrenchAutoTickMs = v end)
 -- PM 全场自动维修：自动跑遍全场可修设备（定高滑行，穿墙走直线，不吃虚空）
 CreateToggle(MainPage, "PM全场自动维修", "WrenchTour", State.WrenchTour, function(v)
     if v then
@@ -3502,6 +3721,18 @@ CreateButton(AimbotPage, "检测当前手持武器 (算不算枪 / 自瞄会不�
         State.AutoFire and "开" or "关",
         AutoFire.held and "正在按住左键" or (State.AutoFireClick and "连点模式" or "空闲"),
         math.floor(tonumber(State.AutoFireIntervalMs) or 0)))
+    if State.AutoFire then
+        if AutoFire.safePaused then
+            print(string.format("[NARAMO] 自动开火: 暂停中 —— 附近 %.0f 格有玩家 %s（阈值 %d 格），人走远自动继续",
+                tonumber(AutoFire.nearDist) or 0, tostring(AutoFire.nearName),
+                math.floor(tonumber(State.AutoFireSafeDist) or 150)))
+        else
+            local ignoreCount = 0
+            if type(State.AutoFireSafeIgnore) == "table" then ignoreCount = #State.AutoFireSafeIgnore end
+            print(string.format("[NARAMO] 自动开火: 附近 %d 格内没有需要屏蔽的玩家（不屏蔽名单 %d 人），照常开火",
+                math.floor(tonumber(State.AutoFireSafeDist) or 150), ignoreCount))
+        end
+    end
     pcall(function()
         game:GetService("StarterGui"):SetCore("SendNotification", {
             Title = "NARAMO 持枪检测",
@@ -3517,6 +3748,130 @@ CreateToggle(AimbotPage, "持枪自动开火 (检测到枪就按住左键)", "Au
 end)
 CreateToggle(AimbotPage, "自动开火·改用连点 (半自动枪用)", "AutoFireClick", State.AutoFireClick, function(v) State.AutoFireClick = v end)
 CreateSlider(AimbotPage, "自动开火·连点间隔 (毫秒)", "AutoFireIntervalMs", 20, 1000, State.AutoFireIntervalMs, function(v) State.AutoFireIntervalMs = v end)
+-- 附近有人自动暂停：阈值内有真人玩家就松开左键，人走远后自动继续（队友也算）
+CreateToggle(AimbotPage, "自动开火·附近有人就暂停 (人走远自动继续)", "AutoFireSafe", State.AutoFireSafe, function(v)
+    State.AutoFireSafe = v
+    AutoFire.safePaused = false          -- 关掉时把暂停现场的显示一起清掉
+    print(v and string.format("[NARAMO] 附近有人暂停: 已开启（%d 格内有玩家就停，人走远自动继续）",
+            math.floor(tonumber(State.AutoFireSafeDist) or 150))
+        or "[NARAMO] 附近有人暂停: 已关闭（附近有人也照常开火）")
+end)
+CreateSlider(AimbotPage, "自动开火·暂停距离 (m, 默认 150)", "AutoFireSafeDist", 20, 1000, State.AutoFireSafeDist, function(v) State.AutoFireSafeDist = v end)
+
+-- 不屏蔽名单：名单里的人（例如自己的小号）站在旁边也不会让自动开火暂停。
+-- 下面输入名字回车添加，点名单里的名字删除；按「用户名 / 显示名」不区分大小写匹配。
+-- 包成 do ... end：段内局部变量用完即释放，不占顶层 200 个名额
+do
+local ignoreFrame = Instance.new("ScrollingFrame")
+ignoreFrame.Size = UDim2.new(1, 0, 0, 110)
+ignoreFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+ignoreFrame.BorderSizePixel = 0
+ignoreFrame.ScrollBarThickness = 4
+ignoreFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+ignoreFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ignoreFrame.Parent = AimbotPage
+Instance.new("UICorner", ignoreFrame).CornerRadius = UDim.new(0, 6)
+local ignoreLayout = Instance.new("UIListLayout", ignoreFrame)
+ignoreLayout.Padding = UDim.new(0, 4)
+local ignorePad = Instance.new("UIPadding", ignoreFrame)
+ignorePad.PaddingTop = UDim.new(0, 6)
+ignorePad.PaddingLeft = UDim.new(0, 6)
+ignorePad.PaddingRight = UDim.new(0, 6)
+
+local function RefreshIgnoreList()
+    for _, child in ipairs(ignoreFrame:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("TextLabel") then child:Destroy() end
+    end
+    local list = State.AutoFireSafeIgnore
+    if type(list) ~= "table" then
+        list = {}
+        State.AutoFireSafeIgnore = list
+    end
+    if #list == 0 then
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -12, 0, 0)
+        lbl.AutomaticSize = Enum.AutomaticSize.Y
+        lbl.BackgroundTransparency = 1
+        lbl.TextWrapped = true
+        lbl.TextYAlignment = Enum.TextYAlignment.Top
+        lbl.Text = "（空：附近有玩家就会暂停；把不想算进去的名字加进来，比如小号）"
+        lbl.TextColor3 = Color3.fromRGB(150, 150, 160)
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 12
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = ignoreFrame
+        return
+    end
+    for i, name in ipairs(list) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -12, 0, 26)
+        btn.BackgroundColor3 = Color3.fromRGB(45, 75, 55)
+        btn.BorderSizePixel = 0
+        btn.Text = "  " .. tostring(name) .. "   (点击移除)"
+        btn.TextColor3 = Color3.fromRGB(210, 235, 215)
+        btn.Font = Enum.Font.Gotham
+        btn.TextSize = 12
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.Parent = ignoreFrame
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+        btn.MouseButton1Click:Connect(function()
+            local ok, removed = AutoFire.RemoveIgnore(i)
+            if ok then
+                print("[NARAMO] 不屏蔽名单: 已移除 " .. tostring(removed)
+                    .. "（这个人再靠近会重新暂停自动开火）")
+                RefreshIgnoreList()
+            end
+        end)
+    end
+end
+-- 配置加载后也要刷新这张表：用全局名，不新增顶层 local
+NARAMO_RefreshAutoFireIgnore = RefreshIgnoreList
+
+local ignoreBox
+ignoreBox = CreateInput(AimbotPage, "输入不屏蔽的名字 (小号)，回车添加", function(text)
+    local ok, nameOrErr = AutoFire.AddIgnore(text)
+    if ok then
+        if ignoreBox then ignoreBox.Text = "" end
+        print("[NARAMO] 不屏蔽名单: 已添加 " .. tostring(nameOrErr)
+            .. "（这个人在附近不会让自动开火暂停）")
+        RefreshIgnoreList()
+    else
+        print("[NARAMO] 不屏蔽名单: 添加失败 —— " .. tostring(nameOrErr))
+    end
+end)
+CreateButton(AimbotPage, "清空不屏蔽名单", function()
+    State.AutoFireSafeIgnore = {}
+    RefreshIgnoreList()
+    print("[NARAMO] 不屏蔽名单已清空（附近有人会重新暂停自动开火）")
+end)
+
+RefreshIgnoreList()
+end   -- 不屏蔽名单段结束
+
+-- 视角自检：排查「暂停后恢复，视角跑偏」用的。开火时如果视角又偏了，点一下这个，
+-- 看打印出来的鼠标状态 / 点击点，就知道是不是还在把光标拽到别处。
+CreateButton(AimbotPage, "自动开火·视角自检 (鼠标状态 / 点击点 / 相机朝向)", function()
+    local cam = workspace.CurrentCamera
+    local cf = cam and cam.CFrame
+    local yaw, pitch = 0, 0
+    if cf then
+        local look = cf.LookVector
+        yaw = math.deg(math.atan2(-look.X, -look.Z))
+        pitch = math.deg(math.asin(math.clamp(look.Y, -1, 1)))
+    end
+    local posText, mbText = "读不到", "?"
+    pcall(function()
+        local pos = UserInputService:GetMouseLocation()
+        posText = string.format("(%.0f, %.0f)", pos.X, pos.Y)
+    end)
+    pcall(function() mbText = tostring(UserInputService.MouseBehavior) end)
+    local x, y, over = AutoFire.ClickPoint()
+    print(string.format(
+        "[NARAMO] 自动开火自检: 相机 yaw %.1f / pitch %.1f | 鼠标位置 %s | 鼠标状态 %s | 下次点击点 (%d, %d)%s",
+        yaw, pitch, posText, mbText, x, y,
+        over and "（压在自己面板上，按下时会临时隐藏面板）" or ""))
+end)
+
 CreateToggle(AimbotPage, "显示 FOV 圈", "ShowFOV", State.ShowFOV, function(v) State.ShowFOV = v end)
 CreateSlider(AimbotPage, "FOV 范围", "AimbotFOV", 20, 500, State.AimbotFOV, function(v) State.AimbotFOV = v end)
 CreateSlider(AimbotPage, "最远自瞄距离 (studs)", "AimMaxDist", 50, 5000, State.AimMaxDist, function(v) State.AimMaxDist = v end)
@@ -4233,6 +4588,9 @@ local function ApplyConfig(data)
     State.ESPColorIdx = math.clamp(tonumber(State.ESPColorIdx) or 1, 1, #Colors)
     if type(State.UserList) ~= "table" then State.UserList = DeepCopy(DefaultState.UserList) end
     if type(RefreshAdminList) == "function" then RefreshAdminList() end
+    -- 不屏蔽名单同理：手改过 / 旧配置里没有这个字段都要能兜住，界面列表跟着重建
+    if type(State.AutoFireSafeIgnore) ~= "table" then State.AutoFireSafeIgnore = {} end
+    if type(NARAMO_RefreshAutoFireIgnore) == "function" then NARAMO_RefreshAutoFireIgnore() end
     return uiCount, rawCount
 end
 
@@ -5176,6 +5534,13 @@ Track(RunService.RenderStepped:Connect(function()
                 local vp = workspace.CurrentCamera.ViewportSize
                 LockText.Text = "仅持枪时自瞄：手上不是枪"
                     .. (gunName and ("（" .. gunName .. "）") or "（空手）")
+                LockText.Position = Vector2.new(vp.X / 2 + 26, vp.Y / 2 + 20)
+                LockText.Visible = true
+            elseif State.AutoFire and AutoFire.safePaused then
+                -- 自动开火被「附近有人」暂停时也在屏幕上说一句，不用开控制台也知道原因
+                local vp = workspace.CurrentCamera.ViewportSize
+                LockText.Text = string.format("自动开火：附近 %.0f 格有玩家，已暂停",
+                    tonumber(AutoFire.nearDist) or 0)
                 LockText.Position = Vector2.new(vp.X / 2 + 26, vp.Y / 2 + 20)
                 LockText.Visible = true
             else
