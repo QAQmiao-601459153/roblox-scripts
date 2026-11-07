@@ -49,6 +49,15 @@
 -- 新增 26: 「持枪自动开火」—— 检测到手上有枪就模拟按住鼠标左键（全自动枪一直打），
 --          收枪 / 换非枪工具 / 死亡 / 聊天框聚焦 / 关脚本都会自动松开；
 --          半自动枪按住只响一发，面板上可切「改用连点」并按毫秒设间隔。
+-- 修复 27: 「配置」页点配置名不再直接加载 —— 点一下只是「选中」（列表高亮 + 写进输入框），
+--          要应用得点「加载选中配置」；启动时自动加载的那份也会被自动选中
+-- 新增 28: 自动加载按钮跟着选中项变 —— 选中的正好是自动加载项时，按钮变成
+--          「取消自动加载」，再点一下就把 _auto.txt 删掉（没有 delfile 就清空内容），
+--          列表里自动加载项前面有 ★；删掉配置时如果它正好是自动加载项，会一并取消
+-- 新增 29: 「车辆」页新增坐标点收藏 —— 可命名保存多个地点（存
+--          NARAMO_Configs/_vehicle_points.json，不跟配置走，换配置不会丢），
+--          点坐标点直接传送、点「删」删除；记录坐标也不再要求坐在车上，
+--          步行时用「记录脚下位置」（从角色身上向下打射线取真实地面点）
 -- ============================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -62,7 +71,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- 版本号：启动日志里会带上，方便确认跑的是哪一版
-local SCRIPT_VERSION = "2026-11-04 r54 · 新增持枪自动开火（持枪即模拟按住左键）"
+local SCRIPT_VERSION = "2026-11-06 r55 · 配置改为选中、车辆坐标收藏、步行取脚下坐标"
 
 -- ============================ 内置管理员名单 ============================
 -- 来源：mod.txt。注意 —— 那个文件里每两行一组，只有**带 @ 的那一行**是真实用户名，
@@ -134,6 +143,9 @@ local State = {
     VehicleHoverEnabled = false, VehicleHoverHeight = 8, VehicleHoverGain = 8,
     -- 车辆传送：坐标一律按「车体锚点 (model pivot)」，记录 / 传送 / 回填共用同一个点
     VehicleTPCooldown = 3, VehicleTPGlide = false, VehicleTPGlideStep = 25,
+    -- 车辆坐标点收藏：{ {name=.., x=.., y=.., z=..}, ... }
+    -- 单独存 NARAMO_Configs/_vehicle_points.json，不跟着配置走（换配置也不会丢）
+    VehicleTPBookmarks = {},
     UserList = MOD_USERNAMES,
     AutoCheck = false, CheckInterval = 5, AutoExit = false, DisableOnAdmin = false,
     -- 检测到管理员时自动重置角色（本地重置：断关节 + 血量归零 + Dead 状态）
@@ -907,6 +919,26 @@ NARAMO_VehicleAnchor = function()
     local seat = GetCurrentVehicleSeat()
     if not seat then return nil end
     return TPAnchor(seat)
+end
+
+-- 给 UI 用：读「当前脚下」的地面坐标，步行 / 站任何地方都能用（不强求坐在车上）。
+-- 先从 HumanoidRootPart 往下打一条射线取真正踩到的地面点（桥面、楼板也算）；
+-- 打不到地面（悬空、掉出地图）就按 Humanoid 的脚底高度估一个点，保证总有返回值。
+NARAMO_PlayerFeetPosition = function()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not (hrp and hrp:IsA("BasePart")) then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local params = RaycastParams.new()
+    pcall(function() params.FilterType = Enum.RaycastFilterType.Blacklist end)
+    params.FilterDescendantsInstances = { char }
+    local ok, hit = pcall(function()
+        return workspace:Raycast(hrp.Position + Vector3.new(0, 2, 0), Vector3.new(0, -500, 0), params)
+    end)
+    if ok and hit then return hit.Position end
+    local hip = (hum and tonumber(hum.HipHeight)) or 0
+    return Vector3.new(hrp.Position.X, hrp.Position.Y - hip - hrp.Size.Y * 0.5, hrp.Position.Z)
 end
 
 -- 从某点上方 300 studs 往下探地面；探不到返回 nil。
@@ -3589,6 +3621,10 @@ do
         return Vector3.new(n[1], n[2], n[3])
     end
 
+    local function VecToText(v)
+        return string.format("%.0f, %.0f, %.0f", v.X, v.Y, v.Z)
+    end
+
     -- 传送结果弹个通知，省得每次去翻控制台
     local function TPNotify(text)
         pcall(function()
@@ -3596,6 +3632,19 @@ do
                 Title = "车辆传送", Text = tostring(text), Duration = 3,
             })
         end)
+    end
+
+    -- 当前位置：坐车时取车座锚点，步行时取脚下地面点 —— 不用非得在车上
+    local function GetCurrentRecordPos()
+        local carPos = NARAMO_VehicleAnchor()
+        if carPos then return carPos, "车座" end
+        local feetPos = NARAMO_PlayerFeetPosition()
+        if feetPos then return feetPos, "脚下" end
+        return nil, nil
+    end
+
+    local function FillTPBox(v)
+        tpBox.Text = VecToText(v)
     end
 
     CreateButton(VehiclePage, "传送到准星位置", function()
@@ -3617,16 +3666,180 @@ do
         TPNotify(msg)
     end)
 
-    CreateButton(VehiclePage, "记录当前车位置 → 填进输入框", function()
+    CreateButton(VehiclePage, "记录车位置 → 输入框（需在车上）", function()
         if IsClosing then return end
         local p = NARAMO_VehicleAnchor()
         if not p then
-            print("[NARAMO] 车辆传送: 没在车上，没东西可记")
+            print("[NARAMO] 车辆传送: 没在车上；想记脚下的位置用下面那个「记录脚下位置」")
             return
         end
-        tpBox.Text = string.format("%.0f, %.0f, %.0f", p.X, p.Y, p.Z)
-        print(string.format("[NARAMO] 已记录车位置 (%.0f, %.0f, %.0f)", p.X, p.Y, p.Z))
+        FillTPBox(p)
+        print(string.format("[NARAMO] 已记录车座位置 (%s)", VecToText(p)))
     end)
+
+    -- 新增：不坐车也能取点 —— 站在地上就能记脚下的坐标
+    CreateButton(VehiclePage, "记录脚下位置 → 输入框（步行也能用）", function()
+        if IsClosing then return end
+        local p = NARAMO_PlayerFeetPosition()
+        if not p then
+            print("[NARAMO] 车辆传送: 读不到角色位置（角色还没加载完？）")
+            return
+        end
+        FillTPBox(p)
+        print(string.format("[NARAMO] 已记录脚下位置 (%s)", VecToText(p)))
+    end)
+
+    -- ==================== 坐标点收藏（多个地点） ====================
+    -- 单独存一个文件，不跟配置走：换/加载配置都不会把攒下来的点冲掉
+    local BOOKMARK_FILE = CONFIG_FOLDER .. "/_vehicle_points.json"
+    local BOOKMARK_LIMIT = 40
+    local BookmarkFrame          -- 前向声明：刷新函数要用
+    local RefreshBookmarks       -- 前向声明：保存按钮要用
+
+    local function SaveBookmarks()
+        if not writefile then return end
+        pcall(function() writefile(BOOKMARK_FILE, HttpService:JSONEncode(State.VehicleTPBookmarks or {})) end)
+    end
+
+    local function LoadBookmarks()
+        State.VehicleTPBookmarks = {}
+        if not (isfile and isfile(BOOKMARK_FILE)) then return end
+        local ok, data = pcall(function() return HttpService:JSONDecode(readfile(BOOKMARK_FILE)) end)
+        if not ok or type(data) ~= "table" then return end
+        for _, item in ipairs(data) do
+            if type(item) == "table" then
+                local x, y, z = tonumber(item.x), tonumber(item.y), tonumber(item.z)
+                if x and y and z then
+                    table.insert(State.VehicleTPBookmarks, {
+                        name = tostring(item.name or ("点 " .. tostring(#State.VehicleTPBookmarks + 1))),
+                        x = x, y = y, z = z,
+                    })
+                end
+            end
+        end
+    end
+
+    local bmNameBox = CreateInput(VehiclePage, "坐标点名称（可留空，自动编号）", nil)
+    CreateButton(VehiclePage, "保存当前坐标（车上取车座 / 步行取脚下）", function()
+        if IsClosing then return end
+        if type(State.VehicleTPBookmarks) ~= "table" then State.VehicleTPBookmarks = {} end
+        local list = State.VehicleTPBookmarks
+        if #list >= BOOKMARK_LIMIT then
+            print(string.format("[NARAMO] 坐标点最多存 %d 个，先删掉几个再用", BOOKMARK_LIMIT))
+            return
+        end
+        local p, tag = GetCurrentRecordPos()
+        if not p then
+            print("[NARAMO] 坐标点: 读不到当前位置")
+            return
+        end
+        local name = tostring(bmNameBox.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then name = "点 " .. tostring(#list + 1) end
+        table.insert(list, { name = name, x = p.X, y = p.Y, z = p.Z })
+        bmNameBox.Text = ""
+        SaveBookmarks()
+        RefreshBookmarks()
+        FillTPBox(p)
+        print(string.format("[NARAMO] 已保存坐标点「%s」(%s)：%s", name, tag, VecToText(p)))
+    end)
+
+    local bmTitle = Instance.new("TextLabel")
+    bmTitle.Size = UDim2.new(1, 0, 0, 18)
+    bmTitle.BackgroundTransparency = 1
+    bmTitle.Text = "已保存的坐标点（点一下直接传送，点「删」删除）"
+    bmTitle.TextColor3 = Color3.fromRGB(160, 170, 190)
+    bmTitle.Font = Enum.Font.Gotham
+    bmTitle.TextSize = 12
+    bmTitle.TextXAlignment = Enum.TextXAlignment.Left
+    bmTitle.Parent = VehiclePage
+
+    BookmarkFrame = Instance.new("ScrollingFrame")
+    BookmarkFrame.Size = UDim2.new(1, 0, 0, 150)
+    BookmarkFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    BookmarkFrame.BorderSizePixel = 0
+    BookmarkFrame.ScrollBarThickness = 4
+    BookmarkFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    BookmarkFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    BookmarkFrame.Parent = VehiclePage
+    Instance.new("UICorner", BookmarkFrame).CornerRadius = UDim.new(0, 6)
+    local bmLayout = Instance.new("UIListLayout", BookmarkFrame)
+    bmLayout.Padding = UDim.new(0, 4)
+    local bmPad = Instance.new("UIPadding", BookmarkFrame)
+    bmPad.PaddingTop = UDim.new(0, 6)
+    bmPad.PaddingLeft = UDim.new(0, 6)
+    bmPad.PaddingRight = UDim.new(0, 6)
+
+    RefreshBookmarks = function()
+        if not BookmarkFrame then return end
+        for _, child in ipairs(BookmarkFrame:GetChildren()) do
+            if child:IsA("Frame") or child:IsA("TextButton") or child:IsA("TextLabel") then child:Destroy() end
+        end
+
+        local list = State.VehicleTPBookmarks or {}
+        if #list == 0 then
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, -12, 0, 24)
+            lbl.BackgroundTransparency = 1
+            lbl.Text = "（还没有保存的坐标点）"
+            lbl.TextColor3 = Color3.fromRGB(150, 150, 160)
+            lbl.Font = Enum.Font.Gotham
+            lbl.TextSize = 12
+            lbl.TextXAlignment = Enum.TextXAlignment.Left
+            lbl.Parent = BookmarkFrame
+            return
+        end
+
+        for i, item in ipairs(list) do
+            local row = Instance.new("Frame")
+            row.Size = UDim2.new(1, -12, 0, 30)
+            row.BackgroundTransparency = 1
+            row.Parent = BookmarkFrame
+
+            -- 主按钮：点一下直接传送到这个点（不在车上会提示，不会乱动）
+            local go = Instance.new("TextButton")
+            go.Size = UDim2.new(1, -34, 1, 0)
+            go.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            go.BorderSizePixel = 0
+            go.Text = string.format("  %d. %s  (%.0f, %.0f, %.0f)", i, tostring(item.name), item.x, item.y, item.z)
+            pcall(function() go.TextTruncate = Enum.TextTruncate.AtEnd end)   -- 老执行器没有这个属性
+            go.TextColor3 = Color3.fromRGB(220, 220, 225)
+            go.Font = Enum.Font.Gotham
+            go.TextSize = 12
+            go.TextXAlignment = Enum.TextXAlignment.Left
+            go.Parent = row
+            Instance.new("UICorner", go).CornerRadius = UDim.new(0, 4)
+            go.MouseButton1Click:Connect(function()
+                if IsClosing then return end
+                local v = Vector3.new(item.x, item.y, item.z)
+                FillTPBox(v)
+                local ok, msg = NARAMO_VehicleTeleport(v, { exactY = true })
+                print("[NARAMO] 坐标点「" .. tostring(item.name) .. "」: " .. tostring(msg))
+                TPNotify(msg)
+            end)
+
+            local del = Instance.new("TextButton")
+            del.Size = UDim2.new(0, 30, 1, 0)
+            del.Position = UDim2.new(1, -30, 0, 0)
+            del.BackgroundColor3 = Color3.fromRGB(120, 45, 45)
+            del.BorderSizePixel = 0
+            del.Text = "删"
+            del.TextColor3 = Color3.fromRGB(240, 210, 210)
+            del.Font = Enum.Font.Gotham
+            del.TextSize = 12
+            del.Parent = row
+            Instance.new("UICorner", del).CornerRadius = UDim.new(0, 4)
+            del.MouseButton1Click:Connect(function()
+                if IsClosing then return end
+                table.remove(State.VehicleTPBookmarks, i)
+                SaveBookmarks()
+                RefreshBookmarks()
+                print("[NARAMO] 已删除坐标点: " .. tostring(item.name))
+            end)
+        end
+    end
+
+    LoadBookmarks()
+    RefreshBookmarks()
 
     CreateSlider(VehiclePage, "传送冷却 (秒)", "VehicleTPCooldown", 0, 30, State.VehicleTPCooldown, function(v)
         State.VehicleTPCooldown = v
@@ -3973,8 +4186,29 @@ end)
 RefreshAdminList()
 
 -- 配置页面
+-- 包成 do ... end：页面局部变量用完即释放，不占顶层 200 个名额
+do
 local ConfigPage = CreatePage("配置")
 local configName = "default"
+local autoConfigName = nil      -- _auto.txt 里记着的自动加载配置名，没有就是 nil
+local loadedName = nil          -- 当前界面状态是从哪个配置加载来的（保存时用来提醒覆盖）
+local AUTO_FILE = CONFIG_FOLDER .. "/_auto.txt"
+
+-- 页头说明：点列表只是选中，不会立刻加载
+local configHint = Instance.new("TextLabel")
+configHint.Size = UDim2.new(1, 0, 0, 0)
+configHint.AutomaticSize = Enum.AutomaticSize.Y
+configHint.BackgroundTransparency = 1
+configHint.TextWrapped = true
+configHint.TextXAlignment = Enum.TextXAlignment.Left
+configHint.TextYAlignment = Enum.TextYAlignment.Top
+configHint.Font = Enum.Font.Gotham
+configHint.TextSize = 12
+configHint.TextColor3 = Color3.fromRGB(150, 160, 180)
+configHint.Text = "列表里点一下只是「选中」这个配置，不会马上加载；选中后再点「加载选中配置」才生效。"
+    .. "如果选中的这份正好是自动加载项，下面的按钮会变成「取消自动加载」，点它就取消。"
+    .. "自动加载的那份在列表名前有 ★。"
+configHint.Parent = ConfigPage
 
 -- 配置回填：有对应控件就走控件（界面 + State 一起变），没有的直接写 State
 -- 对应 xk 里 SaveManager:LoadAutoloadConfig() + 控件:SetValue() 的做法
@@ -3982,7 +4216,9 @@ local function ApplyConfig(data)
     if type(data) ~= "table" then return 0, 0 end
     local uiCount, rawCount = 0, 0
     for k, v in pairs(data) do
-        if UIControls[k] then
+        if k == "VehicleTPBookmarks" then
+            -- 坐标点收藏单独存 _vehicle_points.json，加载配置时不动它
+        elseif UIControls[k] then
             if SetControl(k, v) then
                 uiCount = uiCount + 1
             else
@@ -4006,12 +4242,58 @@ local function LoadConfigByName(name)
     local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     if not ok or type(data) ~= "table" then return false, "解析失败" end
     local ui, raw = ApplyConfig(data)
+    loadedName = name
     return true, string.format("界面同步 %d 项 / 直接写入 %d 项", ui, raw)
 end
 
-local configNameBox = CreateInput(ConfigPage, "输入配置文件名...", function(text) if text ~= "" then configName = text end end)
+-- _auto.txt 里只有一行配置名；读写都收在这里
+local function ReadAutoName()
+    if not (isfile and isfile(AUTO_FILE)) then return nil end
+    local ok, content = pcall(readfile, AUTO_FILE)
+    if not ok or type(content) ~= "string" then return nil end
+    local name = content:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return nil end
+    return name
+end
 
--- 已有配置文件列表（自动读取 CONFIG_FOLDER，点一下直接加载）
+-- name 为 nil 表示「取消自动加载」
+local function WriteAutoName(name)
+    if name == nil then
+        if not (isfile and isfile(AUTO_FILE)) then return true end
+        local ok = false
+        if type(delfile) == "function" then ok = pcall(delfile, AUTO_FILE) end
+        if not ok and writefile then
+            -- 没有 delfile 的执行器：把内容清空，ReadAutoName 读到空串同样当没设置
+            ok = pcall(function() writefile(AUTO_FILE, "") end)
+        end
+        return ok and true or false
+    end
+    if not writefile then return false end
+    return pcall(function() writefile(AUTO_FILE, name) end) and true or false
+end
+
+local autoBtn                   -- 「设为 / 取消自动加载」按钮，选中项一变就改它的字
+local SelectConfig              -- 列表点一下 → 选中（在下面赋值）
+
+-- 按「选中的配置是不是自动加载项」切换按钮文字和颜色
+local function UpdateAutoButton()
+    if not autoBtn then return end
+    if configName ~= "" and autoConfigName == configName then
+        autoBtn.Text = "取消自动加载（当前: " .. configName .. "）"
+        autoBtn.BackgroundColor3 = Color3.fromRGB(150, 80, 40)
+    else
+        autoBtn.Text = "设为自动加载"
+        autoBtn.BackgroundColor3 = Color3.fromRGB(50, 110, 70)
+    end
+end
+
+local configNameBox = CreateInput(ConfigPage, "输入配置文件名...", function(text)
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return end
+    SelectConfig(text)   -- 手输的名字也算选中（还不存在的文件也能先起个名）
+end)
+
+-- 已有配置文件列表（自动读取 CONFIG_FOLDER，点一下只选中，不加载）
 local ConfigListFrame = Instance.new("ScrollingFrame")
 ConfigListFrame.Size = UDim2.new(1, 0, 0, 170)
 ConfigListFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
@@ -4021,8 +4303,7 @@ ConfigListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
 ConfigListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
 ConfigListFrame.Parent = ConfigPage
 Instance.new("UICorner", ConfigListFrame).CornerRadius = UDim.new(0, 6)
-local cfgListLayout = Instance.new("UIListLayout", ConfigListFrame)
-cfgListLayout.Padding = UDim.new(0, 4)
+Instance.new("UIListLayout", ConfigListFrame).Padding = UDim.new(0, 4)
 local cfgListPad = Instance.new("UIPadding", ConfigListFrame)
 cfgListPad.PaddingTop = UDim.new(0, 6)
 cfgListPad.PaddingLeft = UDim.new(0, 6)
@@ -4038,7 +4319,8 @@ local function RefreshConfigList()
     if ok and type(files) == "table" then
         for _, path in ipairs(files) do
             local name = tostring(path):match("([^/\\]+)%.json$")
-            if name then table.insert(names, name) end
+            -- 下划线开头的是内部文件（_vehicle_points.json 这种），不算配置
+            if name and not name:match("^_") then table.insert(names, name) end
         end
     end
     table.sort(names)
@@ -4057,26 +4339,34 @@ local function RefreshConfigList()
     end
 
     for _, name in ipairs(names) do
+        local isSelected = (name == configName)
+        local isAuto = (name == autoConfigName)
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(1, -12, 0, 28)
-        btn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+        btn.BackgroundColor3 = isSelected and Color3.fromRGB(60, 90, 160) or Color3.fromRGB(40, 40, 50)
         btn.BorderSizePixel = 0
-        btn.Text = "  " .. name
-        btn.TextColor3 = Color3.fromRGB(220, 220, 225)
+        btn.Text = "  " .. (isAuto and "★ " or "") .. name
+        btn.TextColor3 = isSelected and Color3.fromRGB(255, 255, 255)
+            or (isAuto and Color3.fromRGB(150, 210, 160) or Color3.fromRGB(220, 220, 225))
         btn.Font = Enum.Font.Gotham
         btn.TextSize = 12
         btn.TextXAlignment = Enum.TextXAlignment.Left
         btn.Parent = ConfigListFrame
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
         btn.MouseButton1Click:Connect(function()
-            configName = name
-            if configNameBox then configNameBox.Text = name end
-            local okLoad, msg = LoadConfigByName(name)
-            print(okLoad and ("配置已加载: " .. name .. " (" .. msg .. ")")
-                or ("配置加载失败: " .. name .. " - " .. msg))
+            SelectConfig(name)   -- 只选中，不加载
         end)
     end
     return #names
+end
+
+-- 选中某个配置：只改选中项 + 刷新高亮/按钮，不动 State
+SelectConfig = function(name)
+    configName = tostring(name or "")
+    if configNameBox then configNameBox.Text = configName end
+    UpdateAutoButton()
+    RefreshConfigList()
+    print("[NARAMO] 已选中配置: " .. configName .. "（点「加载选中配置」才会应用）")
 end
 
 CreateButton(ConfigPage, "刷新配置列表", function()
@@ -4086,43 +4376,90 @@ end)
 
 CreateButton(ConfigPage, "保存当前配置", function()
     local path = CONFIG_FOLDER .. "/" .. configName .. ".json"
-    if writefile then
-        local ok, err = pcall(function() writefile(path, HttpService:JSONEncode(State)) end)
-        print(ok and ("配置已保存: " .. path) or ("配置保存失败: " .. tostring(err)))
-        if ok then RefreshConfigList() end
+    if not writefile then
+        print("[NARAMO] 配置保存失败：执行器不支持 writefile")
+        return
+    end
+    if loadedName ~= configName then
+        print("[NARAMO] 提醒：当前界面状态来自「" .. tostring(loadedName or "未加载")
+            .. "」，保存会用它覆盖「" .. configName .. "」")
+    end
+    -- 坐标点收藏不写进配置（单独存 _vehicle_points.json），免得加载配置把攒的点冲掉
+    local snapshot = {}
+    for k, v in pairs(State) do
+        if k ~= "VehicleTPBookmarks" then snapshot[k] = v end
+    end
+    local ok, err = pcall(function() writefile(path, HttpService:JSONEncode(snapshot)) end)
+    print(ok and ("配置已保存: " .. path) or ("配置保存失败: " .. tostring(err)))
+    if ok then
+        loadedName = configName   -- 保存后，这份配置就和当前状态一致了
+        RefreshConfigList()
     end
 end)
-CreateButton(ConfigPage, "加载当前配置", function()
+CreateButton(ConfigPage, "加载选中配置", function()
     local ok, msg = LoadConfigByName(configName)
     print(ok and ("配置已加载: " .. configName .. " (" .. msg .. ")") or ("配置加载失败: " .. configName .. " - " .. msg))
 end)
-CreateButton(ConfigPage, "删除当前配置", function()
+CreateButton(ConfigPage, "删除选中配置", function()
     local path = CONFIG_FOLDER .. "/" .. configName .. ".json"
     if isfile and isfile(path) then
         pcall(function() delfile(path) end)
         print("配置已删除: " .. configName)
+        if loadedName == configName then loadedName = nil end
+        if autoConfigName == configName then
+            WriteAutoName(nil)
+            autoConfigName = nil
+            print("[NARAMO] 这份配置本来是自动加载项，已一并取消自动加载")
+            UpdateAutoButton()
+        end
         RefreshConfigList()
     end
 end)
-CreateButton(ConfigPage, "设为自动加载", function()
-    local path = CONFIG_FOLDER .. "/" .. configName .. ".json"
-    if isfile and isfile(path) then
-        pcall(function() writefile(CONFIG_FOLDER .. "/_auto.txt", configName) end)
-        print("已设为自动加载: " .. configName)
+
+autoBtn = CreateButton(ConfigPage, "设为自动加载", function()
+    if configName == "" then
+        print("[NARAMO] 先在列表里选中一个配置")
+        return
     end
+    if autoConfigName == configName then
+        -- 选中的就是自动加载项 → 这个按钮此刻是「取消自动加载」
+        if WriteAutoName(nil) then
+            print("[NARAMO] 已取消自动加载: " .. configName)
+            autoConfigName = nil
+        else
+            print("[NARAMO] 取消自动加载失败：删不掉/清空不了 " .. AUTO_FILE)
+        end
+    else
+        local path = CONFIG_FOLDER .. "/" .. configName .. ".json"
+        if not (isfile and isfile(path)) then
+            print("[NARAMO] 这个配置还没保存过，先点「保存当前配置」再设自动加载")
+            return
+        end
+        if WriteAutoName(configName) then
+            print("[NARAMO] 已设为自动加载: " .. configName)
+            autoConfigName = configName
+        else
+            print("[NARAMO] 设置自动加载失败：执行器不支持 writefile")
+        end
+    end
+    UpdateAutoButton()
+    RefreshConfigList()   -- 列表上的 ★ 跟着变
 end)
+UpdateAutoButton()
 
 -- 自动加载放在所有控件创建之后：此时 UIControls 已齐全，勾选状态也能同步
-if isfile and isfile(CONFIG_FOLDER .. "/_auto.txt") then
-    local okRead, autoName = pcall(readfile, CONFIG_FOLDER .. "/_auto.txt")
-    if okRead and autoName then
-        autoName = autoName:gsub("^%s+", ""):gsub("%s+$", "")   -- 去掉文件尾换行
-        local ok, msg = LoadConfigByName(autoName)
-        print(ok and ("已自动加载配置: " .. autoName .. " (" .. msg .. ")") or ("自动加载失败: " .. autoName .. " - " .. msg))
-    end
+autoConfigName = ReadAutoName()
+if autoConfigName then
+    local ok, msg = LoadConfigByName(autoConfigName)
+    print(ok and ("已自动加载配置: " .. autoConfigName .. " (" .. msg .. ")") or ("自动加载失败: " .. autoConfigName .. " - " .. msg))
+    -- 顺手选中自动加载的那份：一进来就能看到它，也能直接点「取消自动加载」
+    configName = autoConfigName
+    if configNameBox then configNameBox.Text = autoConfigName end
 end
 
+UpdateAutoButton()
 RefreshConfigList()
+end   -- 配置页面结束
 
 -- ============================ 后台执行逻辑 ============================
 Track(UserInputService.JumpRequest:Connect(function()
